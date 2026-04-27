@@ -86,8 +86,8 @@ class App {
 			clearCache: config.clearCache || false,
 			runComposer: config.runComposer || false,
 			verbose: this.options.verbose || config.verbose || false,
-			client_id: config.client_id || process.env.CLIENT_ID || process.env.XFIX_CLIENT_ID,
-			api_key: config.api_key || process.env.API_KEY || process.env.XFIX_API_KEY,
+			clientId: config.clientId || process.env.CLIENT_ID || process.env.XFIX_CLIENT_ID,
+			apiKey: config.apiKey || process.env.API_KEY || process.env.XFIX_API_KEY,
 
 			// Obfuscation settings
 			obfuscateJs: this.options.obfuscateJs || config.obfuscateJs || false,
@@ -338,8 +338,8 @@ class App {
 				headers: {
 					'User-Agent': 'XFIX-Deploy/1.0',
 					'Content-Type': 'application/x-www-form-urlencoded',
-					'X-API-Key': config.api_key,
-					'XFIX-CLIENT-ID': config.client_id
+					'X-API-Key': config.apiKey,
+					'XFIX-CLIENT-ID': config.clientId
 				}
 			});
 

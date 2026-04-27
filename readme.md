@@ -378,5 +378,3 @@ This project follows semantic versioning:
 ## Support
 
 Open an [issue](https://github.com/Gicehajunior/xfix-cli/issues). on the repository for bugs or feature requests.
-
-```
