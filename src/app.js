@@ -53,7 +53,7 @@ class App {
 			// Stats
 			total: null,
 			included: null,
-			excluded: null,
+			excluded: null, 
 
 			...options
 		};
@@ -112,6 +112,16 @@ class App {
 			domainLockRedirectUrl: this.options.domainLockRedirectUrl ||
 				config.domainLockRedirectUrl ||
 				'http://localhost',
+
+			// Database configurations
+			databaseHost: config.databaseHost || process.env.DB_HOST || 'localhost',
+			databaseUser: config.databaseUser || process.env.DB_USER || 'root',
+			databasePassword: config.databasePassword || process.env.DB_PASSWORD || '',
+			databaseName: config.databaseName || process.env.DB_NAME || 'xfix_db',
+			databasePort: config.databasePort || parseInt(process.env.DB_PORT || '3306'),
+			waitDatabaseForConnections: config.waitDatabaseForConnections || true,
+			databaseConnectionLimit: config.databaseConnectionLimit || 10,
+			databaseQueueLimit: config.databaseQueueLimit || 0
 		};
 	}
 
@@ -1200,14 +1210,14 @@ class App {
 		
 		// Load database config from environment or config file
 		this.dbConfig = {
-			host: process.env.DB_HOST || 'localhost',
-			user: process.env.DB_USER || 'root',
-			password: process.env.DB_PASSWORD || '',
-			database: process.env.DB_NAME || 'xfix_db',
-			port: parseInt(process.env.DB_PORT || '3306'),
-			waitForConnections: true,
-			connectionLimit: 10,
-			queueLimit: 0
+			host: config.databaseHost,
+			user: config.databaseUser,
+			password: config.databasePassword,
+			database: config.databaseName,
+			port: config.databasePort,
+			waitForConnections: config.waitDatabaseForConnections || true,
+			connectionLimit: config.databaseConnectionLimit || 10,
+			queueLimit: config.databaseQueueLimit || 0
 		};
 		
 		try {
