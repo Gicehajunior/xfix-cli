@@ -13,6 +13,10 @@ import javascriptObfuscator from 'gulp-javascript-obfuscator';
 import { promisify } from 'util';
 import { glob } from 'glob';
 import fg from 'fast-glob';
+import mysql from 'mysql2/promise';
+import pg from 'pg'; 
+import sqlite3 from 'sqlite3';
+import { open } from 'sqlite';
 
 class App {
 	constructor(options = {}) {
@@ -1179,6 +1183,679 @@ class App {
 		} catch (error) {
 			console.error(`\n❌ Obfuscation failed: ${error.message}\n`);
 			throw error;
+		}
+	}
+	
+	/**
+	* DATABASE MIGRATION & SEED METHODS
+	*/
+
+	/**
+	 * Initialize database connection and migration system
+	 */
+	async initDatabase() {
+		if (this.db) return this.db;
+		
+		const config = await this.loadConfig();
+		
+		// Load database config from environment or config file
+		this.dbConfig = {
+			host: process.env.DB_HOST || 'localhost',
+			user: process.env.DB_USER || 'root',
+			password: process.env.DB_PASSWORD || '',
+			database: process.env.DB_NAME || 'xfix_db',
+			port: parseInt(process.env.DB_PORT || '3306'),
+			waitForConnections: true,
+			connectionLimit: 10,
+			queueLimit: 0
+		};
+		
+		try {
+			this.db = await mysql.createConnection(this.dbConfig);
+			await this.createMigrationsTable();
+			
+			if (this.options.verbose) {
+				console.log('✅ Database connected successfully');
+			}
+			
+			return this.db;
+		} catch (error) {
+			throw new Error(`❌ Database connection failed: ${error.message}`);
+		}
+	}
+
+	/**
+	 * Create migrations tracking table
+	 */
+	async createMigrationsTable() {
+		const sql = `
+			CREATE TABLE IF NOT EXISTS migrations (
+				id INT AUTO_INCREMENT PRIMARY KEY,
+				migration VARCHAR(255) NOT NULL,
+				batch INT NOT NULL,
+				executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+				UNIQUE KEY unique_migration (migration)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+		`;
+		
+		await this.db.execute(sql);
+	}
+
+	/**
+	 * Create a new migration file
+	 */
+	async createMigration(options) {
+		const { name, table, template = 'create', verbose } = options;
+		
+		// Generate timestamp for migration filename
+		const now = new Date();
+		const timestamp = now.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
+		const filename = `${timestamp}_${name}.mjs`; // Use .mjs extension
+		const migrationsDir = path.join(this.ROOT, 'public/storage/database', 'migrations');
+		
+		// Ensure migrations directory exists
+		await fs.ensureDir(migrationsDir);
+		
+		const filepath = path.join(migrationsDir, filename);
+		
+		// Generate migration template based on type - AWAIT here!
+		let templateContent = await this.getMigrationTemplate(template, name, table);
+		
+		// Write the migration file
+		await fs.writeFile(filepath, templateContent);
+		
+		if (verbose) {
+			console.log(`📝 Created migration: ${filename}`);
+		} else {
+			console.log(`   ✅ Created: ${filename}`);
+		}
+		
+		return filepath;
+	}
+
+	/**
+	 * Get migration template content from partials folder
+	 */
+	async getMigrationTemplate(type, name, table) {
+		const timestamp = new Date().toISOString();
+		const tableName = table || name.replace(/_table$/, '');
+		
+		let templateContent;
+		
+		switch(type) {
+			case 'create':
+				templateContent = await this.templatesReader('migrations/create.js', {
+					tableName: tableName,
+					timestamp: timestamp
+				});
+				break;
+			
+			case 'alter':
+				templateContent = await this.templatesReader('migrations/alter.js', {
+					name: name,
+					tableName: tableName,
+					timestamp: timestamp
+				});
+				break;
+			
+			default:
+				templateContent = await this.templatesReader('migrations/default.js', {
+					name: name,
+					tableName: tableName,
+					timestamp: timestamp
+				});
+				break;
+		}
+		
+		return templateContent;
+	}
+
+	/**
+	 * Template reader utility
+	 * @param {string} templatePath - Path to template file relative to partials directory
+	 * @param {Object} variables - Key-value pairs to replace in the template
+	 * @returns {Promise<string>} - Processed template content
+	 */
+	async templatesReader(templatePath, variables = {}) { 
+		const __filename = fileURLToPath(import.meta.url);
+		const __dirname = path.dirname(__filename);
+		const partialsDir = path.join(__dirname, 'partials');
+		const fullPath = path.join(partialsDir, templatePath);
+		
+		if (!await fs.pathExists(fullPath)) {
+			throw new Error(`Template file not found: ${fullPath}`);
+		}
+		
+		let templateContent = await fs.readFile(fullPath, 'utf-8');
+		
+		// Replace all variables in the template
+		for (const [key, value] of Object.entries(variables)) {
+			const placeholder = `{{${key}}}`; 
+			templateContent = templateContent.split(placeholder).join(value);
+		}
+		
+		return templateContent;
+	}
+
+	/**
+	 * Run pending migrations
+	 */
+	async runMigrations(options = {}) {
+		const { step, dryRun = false, verbose = false } = options;
+		
+		// Ensure database is initialized
+		await this.initDatabase();
+		
+		try {
+			const migrationsDir = path.join(this.ROOT, 'public/storage/database', 'migrations');
+			
+			if (!await fs.pathExists(migrationsDir)) {
+				console.log('📁 No migrations directory found. Creating...');
+				await fs.ensureDir(migrationsDir);
+				return;
+			}
+			
+			// Get all migration files
+			let migrationFiles = await fs.readdir(migrationsDir);
+			migrationFiles = migrationFiles.filter(file => file.endsWith('.mjs')).sort();
+			
+			if (migrationFiles.length === 0) {
+				console.log('📁 No migration files found');
+				return;
+			}
+			
+			// Get already executed migrations
+			const [executed] = await this.db.execute(
+				'SELECT migration FROM migrations ORDER BY batch, id'
+			);
+			const executedMigrations = new Set(executed.map(row => row.migration));
+			
+			// Filter pending migrations
+			let pending = migrationFiles.filter(file => !executedMigrations.has(file));
+			
+			if (step && step > 0) {
+				pending = pending.slice(0, step);
+			}
+			
+			if (pending.length === 0) {
+				console.log('✅ No pending migrations');
+				return;
+			}
+			
+			if (dryRun) {
+				console.log('\n📋 Pending migrations:');
+				pending.forEach(file => console.log(`   • ${file}`));
+				return;
+			}
+			
+			// Get current batch number
+			const [lastBatch] = await this.db.execute(
+				'SELECT COALESCE(MAX(batch), 0) as max_batch FROM migrations'
+			);
+			const currentBatch = (lastBatch[0].max_batch || 0) + 1;
+			
+			console.log(`\n🔄 Running ${pending.length} migration(s) in batch ${currentBatch}...\n`);
+			
+			// Run migrations
+			let successCount = 0;
+			let errorCount = 0;
+			
+			for (const file of pending) {
+				if (verbose) {
+					console.log(`   📝 Running: ${file}`);
+				}
+				
+				try {
+					const migrationPath = path.join(migrationsDir, file);
+					const migration = await import(`file://${migrationPath}`);
+					
+					if (typeof migration.up !== 'function') {
+						throw new Error(`Migration ${file} does not export an 'up' function`);
+					}
+					
+					await migration.up(this.db);
+					
+					// Record migration
+					await this.db.execute(
+						'INSERT INTO migrations (migration, batch) VALUES (?, ?)',
+						[file, currentBatch]
+					);
+					
+					successCount++;
+					if (verbose) {
+						console.log(`   ✅ Completed: ${file}`);
+					} else {
+						console.log(`   ✅ ${file}`);
+					}
+					
+				} catch (err) {
+					errorCount++;
+					console.error(`   ❌ Failed: ${file}`);
+					console.error(`      Error: ${err.message}`);
+					
+					if (verbose) {
+						console.error(err.stack);
+					}
+					
+					// Stop execution on error
+					throw new Error(`Migration failed: ${file} - ${err.message}`);
+				}
+			}
+			
+			console.log(`\n✅ Migrations completed: ${successCount} succeeded, ${errorCount} failed`);
+			
+		} finally {
+			// Always close the database connection
+			await this.closeDatabase();
+		}
+	}
+
+	/**
+	 * Rollback migrations
+	 */
+	async rollbackMigrations(options = {}) {
+		const { step = 1, target, dryRun = false, verbose = false } = options;
+		
+		await this.initDatabase();
+		
+		try {
+			let migrationsToRollback;
+			
+			if (target) {
+				// Rollback to specific migration (including that migration)
+				const [rows] = await this.db.execute(
+					'SELECT migration FROM migrations WHERE migration >= ? ORDER BY batch DESC, id DESC',
+					[target]
+				);
+				migrationsToRollback = rows;
+			} else {
+				// Rollback last batch(es)
+				let batches;
+				
+				if (step === 1) {
+					const [rows] = await this.db.execute(
+						'SELECT MAX(batch) as batch FROM migrations'
+					);
+					batches = rows[0].batch ? [{ batch: rows[0].batch }] : [];
+				} else {
+					const [rows] = await this.db.execute(
+						'SELECT DISTINCT batch FROM migrations ORDER BY batch DESC LIMIT ?',
+						[step]
+					);
+					batches = rows;
+				}
+				
+				if (batches.length === 0 || !batches[0].batch) {
+					console.log('✅ No migrations to rollback');
+					return;
+				}
+				
+				const batchNumbers = batches.map(b => b.batch);
+				const placeholders = batchNumbers.map(() => '?').join(',');
+				
+				const [rows] = await this.db.execute(
+					`SELECT migration FROM migrations WHERE batch IN (${placeholders}) ORDER BY batch DESC, id DESC`,
+					batchNumbers
+				);
+				migrationsToRollback = rows;
+			}
+			
+			if (migrationsToRollback.length === 0) {
+				console.log('✅ No migrations to rollback');
+				return;
+			}
+			
+			if (dryRun) {
+				console.log('\n📋 Migrations to rollback:');
+				migrationsToRollback.forEach(m => console.log(`   • ${m.migration}`));
+				return;
+			}
+			
+			console.log(`\n⏪ Rolling back ${migrationsToRollback.length} migration(s)...\n`);
+			
+			const migrationsDir = path.join(this.ROOT, 'public/storage/database', 'migrations');
+			let successCount = 0;
+			let errorCount = 0;
+			
+			for (const migration of migrationsToRollback) {
+				const file = migration.migration;
+				
+				if (verbose) {
+					console.log(`   📝 Rolling back: ${file}`);
+				} else {
+					console.log(`   ⏪ ${file}`);
+				}
+				
+				try {
+					const migrationPath = path.join(migrationsDir, file);
+					if (!await fs.pathExists(migrationPath)) {
+						console.warn(`   ⚠️  Migration file not found: ${file}`);
+						// Remove from migrations table
+						await this.db.execute(
+							'DELETE FROM migrations WHERE migration = ?',
+							[file]
+						);
+						successCount++;
+						continue;
+					}
+					
+					const migrationModule = await import(`file://${migrationPath}`);
+					
+					if (typeof migrationModule.down !== 'function') {
+						throw new Error(`Migration ${file} does not export a 'down' function`);
+					}
+					
+					await migrationModule.down(this.db);
+					
+					// Remove from migrations table
+					await this.db.execute(
+						'DELETE FROM migrations WHERE migration = ?',
+						[file]
+					);
+					
+					successCount++;
+					if (verbose) {
+						console.log(`   ✅ Rolled back: ${file}`);
+					}
+					
+				} catch (err) {
+					errorCount++;
+					console.error(`   ❌ Failed to rollback: ${file}`);
+					console.error(`      Error: ${err.message}`);
+					throw new Error(`Rollback failed: ${file} - ${err.message}`);
+				}
+			}
+			
+			console.log(`\n✅ Rollback completed: ${successCount} succeeded, ${errorCount} failed`);
+			
+		} finally {
+			// Always close the database connection
+			await this.closeDatabase();
+		}
+	}
+	
+	/**
+	 * Show migration status
+	 */
+	async showMigrationStatus(verbose = false) {
+		await this.initDatabase();
+		
+		try {
+			const migrationsDir = path.join(this.ROOT, 'public/storage/database', 'migrations');
+			
+			if (!await fs.pathExists(migrationsDir)) {
+				console.log('📁 No migrations directory found');
+				return;
+			}
+			
+			// Get all migration files
+			let migrationFiles = await fs.readdir(migrationsDir);
+			migrationFiles = migrationFiles.filter(file => file.endsWith('.mjs')).sort();
+			
+			if (migrationFiles.length === 0) {
+				console.log('📁 No migration files found');
+				return;
+			}
+			
+			// Get executed migrations
+			const [executed] = await this.db.execute(
+				'SELECT migration, batch, executed_at FROM migrations ORDER BY batch, id'
+			);
+			
+			const executedMap = new Map();
+			executed.forEach(row => {
+				executedMap.set(row.migration, {
+					batch: row.batch,
+					executed_at: row.executed_at
+				});
+			});
+			
+			// Display table
+			console.log('\n┌' + '─'.repeat(50) + '┬' + '─'.repeat(10) + '┬' + '─'.repeat(25) + '┐');
+			console.log('│ ' + 'Migration'.padEnd(48) + ' │ ' + 'Status'.padEnd(8) + ' │ ' + 'Batch/Date'.padEnd(23) + ' │');
+			console.log('├' + '─'.repeat(50) + '┼' + '─'.repeat(10) + '┼' + '─'.repeat(25) + '┤');
+			
+			for (const file of migrationFiles) {
+				const status = executedMap.get(file);
+				const statusText = status ? '✓ APPLIED' : '○ PENDING';
+				const info = status 
+					? `Batch ${status.batch}`
+					: 'Not executed';
+				
+				const fileName = file.length > 46 ? file.substring(0, 43) + '...' : file;
+				console.log(`│ ${fileName.padEnd(48)} │ ${statusText.padEnd(8)} │ ${info.padEnd(23)} │`);
+			}
+			
+			console.log('└' + '─'.repeat(50) + '┴' + '─'.repeat(10) + '┴' + '─'.repeat(25) + '┘');
+			
+			if (verbose && executed.length > 0) {
+				console.log('\n📋 Execution Details:');
+				for (const row of executed) {
+					const date = new Date(row.executed_at).toLocaleString();
+					console.log(`   • ${row.migration} - Batch ${row.batch} (${date})`);
+				}
+			}
+			
+			console.log(`\n📊 Summary: ${executed.length} executed, ${migrationFiles.length - executed.length} pending`);
+			
+		} finally {
+			// Always close the database connection
+			await this.closeDatabase();
+		}
+	}
+
+	/**
+	 * Reset all migrations (rollback all and run fresh)
+	 */
+	async resetMigrations(options = {}) {
+		const { seed = false, verbose = false } = options;
+		
+		console.log('\n🔄 Resetting database migrations...\n');
+		
+		await this.initDatabase();
+		
+		// Get all executed migrations
+		const [migrations] = await this.db.execute(
+			'SELECT migration FROM migrations ORDER BY batch DESC, id DESC'
+		);
+		
+		if (migrations.length > 0) {
+			console.log(`📋 Found ${migrations.length} migrations to rollback...\n`);
+			
+			// Rollback all migrations
+			const migrationsDir = path.join(this.ROOT, 'public/storage/database', 'migrations');
+			
+			for (const migration of migrations) {
+				const file = migration.migration;
+				
+				if (verbose) {
+					console.log(`   📝 Rolling back: ${file}`);
+				}
+				
+				try {
+					const migrationPath = path.join(migrationsDir, file);
+					if (await fs.pathExists(migrationPath)) { 
+						const migrationModule = await import(`file://${migrationPath}`);
+							
+						if (typeof migrationModule.down === 'function') {
+							await migrationModule.down(this.db);
+						}
+					}
+					
+					await this.db.execute(
+						'DELETE FROM migrations WHERE migration = ?',
+						[file]
+					);
+					
+					if (!verbose) {
+						console.log(`   ✅ ${file}`);
+					} else {
+						console.log(`   ✅ Rolled back: ${file}`);
+					}
+					
+				} catch (err) {
+					console.error(`   ❌ Failed to rollback: ${file}`);
+					console.error(`      Error: ${err.message}`);
+					throw err;
+				}
+			}
+			
+			console.log(`\n✅ Rolled back ${migrations.length} migration(s)\n`);
+		} else {
+			console.log('No migrations to rollback\n');
+		}
+		
+		// Run migrations fresh
+		console.log('🔄 Running fresh migrations...\n');
+		await this.runMigrations({ verbose });
+		
+		// Run seeders if requested
+		if (seed) {
+			console.log('\n🌱 Running seeders...');
+			await this.runSeeders({ force: true, verbose });
+		}
+		
+		console.log('\n✅ Database reset completed successfully');
+	}
+
+	/**
+	 * Create a new seeder file
+	 */
+	async createSeeder(options) {
+		const { name, verbose } = options;
+		
+		const timestamp = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
+		const filename = `${timestamp}_${name}.mjs`;
+		const seedersDir = path.join(this.ROOT, 'public/storage/database', 'seeders');
+		
+		// Ensure seeders directory exists
+		await fs.ensureDir(seedersDir);
+		
+		const filepath = path.join(seedersDir, filename);
+		
+		// Get seeder template
+		let templateContent = await this.getSeederTemplate(name, timestamp);
+		
+		// Write the seeder file
+		await fs.writeFile(filepath, templateContent);
+		
+		if (verbose) {
+			console.log(`📝 Created seeder: ${filename}`);
+		} else {
+			console.log(`   ✅ Created: ${filename}`);
+		}
+		
+		return filepath;
+	}
+
+	/**
+	 * Get seeder template content from partials folder
+	 */
+	async getSeederTemplate(name, timestamp) {
+		const templateContent = await this.templatesReader('seeders/default.js', {
+			name: name,
+			timestamp: timestamp
+		});
+
+		return templateContent;
+	}
+
+	/**
+	 * Run database seeders
+	 */
+	async runSeeders(options = {}) {
+		const { seederClass, force = false, verbose = false } = options;
+		
+		// Ensure database is initialized
+		await this.initDatabase();
+		
+		try {
+			const seedersDir = path.join(this.ROOT, 'public/storage/database', 'seeders');
+			
+			if (!await fs.pathExists(seedersDir)) {
+				console.log('📁 No seeders directory found. Creating...');
+				await fs.ensureDir(seedersDir);
+				
+				// Create example seeder
+				const timestamp = new Date().toISOString();
+				const exampleSeeder = await this.templatesReader('seeders/example.js', {
+					timestamp: timestamp
+				});
+				
+				await fs.writeFile(path.join(seedersDir, 'ExampleSeeder.mjs'), exampleSeeder);
+				console.log('   📝 Created example seeder: ExampleSeeder.mjs');
+				return;
+			}
+			
+			let seederFiles = await fs.readdir(seedersDir);
+			seederFiles = seederFiles.filter(file => file.endsWith('.js') || file.endsWith('.mjs'));
+			
+			if (seederClass) {
+				seederFiles = seederFiles.filter(file => file.includes(seederClass));
+			}
+			
+			if (seederFiles.length === 0) {
+				console.log('No seeders found');
+				return;
+			}
+			
+			console.log(`\n🌱 Running ${seederFiles.length} seeder(s)...\n`);
+			
+			let successCount = 0;
+			
+			for (const file of seederFiles) {
+				if (verbose) {
+					console.log(`   📝 Running: ${file}`);
+				} else {
+					console.log(`   🌱 ${file}`);
+				}
+				
+				try {
+					const seederPath = path.join(seedersDir, file); 
+					const seeder = await import(`file://${seederPath}`);
+
+					if (typeof seeder.run !== 'function') {
+						throw new Error(`Seeder ${file} does not export a 'run' function`);
+					}
+					
+					await seeder.run(this.db);
+					successCount++;
+					
+					if (verbose) {
+						console.log(`   ✅ Completed: ${file}`);
+					}
+					
+				} catch (err) {
+					console.error(`   ❌ Failed: ${file}`);
+					console.error(`      Error: ${err.message}`);
+					
+					if (verbose && err.stack) {
+						console.error(err.stack);
+					}
+					
+					if (!force) {
+						throw err;
+					}
+				}
+			}
+			
+			console.log(`\n✅ Seeders completed: ${successCount}/${seederFiles.length} succeeded`);
+			
+		} finally {
+			// Close database connection
+			await this.closeDatabase();
+		}
+	}
+
+	/**
+	 * Close database connection
+	 */
+	async closeDatabase() {
+		if (this.db) {
+			await this.db.end();
+			if (this.options.verbose) {
+				console.log('✅ Database connection closed');
+			}
 		}
 	}
 }
