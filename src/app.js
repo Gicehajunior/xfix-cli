@@ -1215,9 +1215,9 @@ class App {
 			password: config.databasePassword,
 			database: config.databaseName,
 			port: config.databasePort,
-			waitForConnections: config.waitDatabaseForConnections || true,
-			connectionLimit: config.databaseConnectionLimit || 10,
-			queueLimit: config.databaseQueueLimit || 0
+			waitForConnections: config.waitDatabaseForConnections,
+			connectionLimit: config.databaseConnectionLimit,
+			queueLimit: config.databaseQueueLimit
 		};
 		
 		try {
