@@ -2,7 +2,7 @@
  * Example Database Seeder
  * Generated: {{timestamp}}
  */
- export async function run(db) {
+export async function run(db) {
     console.log('🌱 Running example seeder...');
     
     // Example: Insert sample data

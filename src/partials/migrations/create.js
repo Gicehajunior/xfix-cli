@@ -2,7 +2,7 @@
  * Migration: Create {{tableName}} table
  * Generated: {{timestamp}}
  */
- export async function up(db) {
+export async function up(db) {
     // Create table
     await db.execute(`
         CREATE TABLE IF NOT EXISTS {{tableName}} (

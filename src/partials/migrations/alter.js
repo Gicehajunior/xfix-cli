@@ -2,7 +2,7 @@
  * Migration: {{name}}
  * Generated: {{timestamp}}
  */
- export async function up(db) {
+export async function up(db) {
     // Write your migration logic here
     console.log('Running migration: {{name}}');
 }

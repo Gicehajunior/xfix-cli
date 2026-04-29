@@ -2,7 +2,7 @@
  * Seeder: {{name}}
  * Generated: {{timestamp}}
  */
- export async function run(db) {
+export async function run(db) {
     console.log('🌱 Running {{name}} seeder...');
     
     // Your seeder logic here
