@@ -30,7 +30,11 @@
     "gulp": "^4.0.2",
     "gulp-javascript-obfuscator": "^1.1.6",
     "ignore": "^5.2.4",
+    "mysql2": "^3.22.3",
     "node-fetch": "^3.3.2",
+    "pg": "^8.20.0",
+    "sqlite": "^5.1.1",
+    "sqlite3": "^6.0.1",
     "vinyl-sourcemaps-apply": "^0.2.1"
   },
   "devDependencies": {

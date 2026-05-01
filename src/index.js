@@ -22,6 +22,7 @@ class CliService {
         this.setupDevCommand();
         this.setupObfuscateCommand();
         this.setupRevertCommand();
+        this.setupDbMigrationsCommand();
 
         // Handle default help
         this.program.on('--help', () => {
@@ -180,7 +181,7 @@ class CliService {
                 await this.handleRevertCommand(options);
             });
     }
-    
+
     /**
      * Handle revert command
      */
@@ -306,6 +307,309 @@ class CliService {
         return options;
     }
 
+
+    setupDbMigrationsCommand() {
+        const dbCommand = this.program
+            .command('db')
+            .description('Database migration management');
+    
+        // Migrate command - run pending migrations
+        dbCommand
+            .command('migrate')
+            .description('Run pending database migrations')
+            .option('--step <n>', 'Run specific number of migrations', parseInt)
+            .option('--dry-run', 'Show what would be executed without running')
+            .option('--verbose', 'Enable verbose output')
+            .action(async (options) => {
+                await this.handleDbMigrateCommand(options);
+            });
+    
+        // Rollback command - revert last migration(s)
+        dbCommand
+            .command('rollback')
+            .description('Rollback last migration or specific number of steps')
+            .option('--step <n>', 'Number of migrations to rollback', parseInt, 1)
+            .option('--target <name>', 'Rollback to specific migration')
+            .option('--dry-run', 'Show what would be rolled back')
+            .option('--verbose', 'Enable verbose output')
+            .action(async (options) => {
+                await this.handleDbRollbackCommand(options);
+            });
+    
+        // Create command - generate new migration
+        dbCommand
+            .command('create <name>')
+            .description('Create a new migration file')
+            .option('--table <name>', 'Specify table name for the migration')
+            .option('--template <type>', 'Migration template type (create, alter, drop)', 'create')
+            .action(async (name, options) => {
+                await this.handleDbCreateCommand(name, options);
+            });
+    
+        // Status command - show migration status
+        dbCommand
+            .command('status')
+            .description('Show migration status (applied/pending)')
+            .option('--verbose', 'Show detailed information')
+            .action(async (options) => {
+                await this.handleDbStatusCommand(options);
+            });
+    
+        // Reset command - rollback all and migrate fresh
+        dbCommand
+            .command('reset')
+            .description('Rollback all migrations and run them again')
+            .option('--seed', 'Run seeders after reset')
+            .option('--force', 'Force reset in production')
+            .option('--verbose', 'Enable verbose output')
+            .action(async (options) => {
+                await this.handleDbResetCommand(options);
+            });
+    
+        // Seed command - run database seeders
+        dbCommand
+            .command('seed')
+            .description('Run database seeders')
+            .option('--class <name>', 'Specific seeder class to run')
+            .option('--force', 'Force seed in production')
+            .option('--verbose', 'Enable verbose output')
+            .action(async (options) => {
+                await this.handleDbSeedCommand(options);
+            });
+
+        // Create command - generate new seeder
+        dbCommand
+            .command('generate:seeder <name>')
+            .description('Create a new seeder file')
+            .option('--verbose', 'Enable verbose output')
+            .action(async (name, options) => {
+                await this.handleDbMakeSeederCommand(name, options);
+            });
+    }
+
+    /**
+     * Handle database migrate command
+     */
+    async handleDbMigrateCommand(options) {
+        try {
+            console.log('\n🗄️  Database Migration:');
+            console.log('─'.repeat(40));
+            
+            const migrationOptions = {
+                step: options.step || null,
+                dryRun: options.dryRun || false,
+                verbose: options.verbose || false
+            };
+            
+            if (migrationOptions.dryRun) {
+                console.log('🔍 DRY RUN MODE - No changes will be applied\n');
+            }
+            
+            if (!this.applicationService) {
+                this.applicationService = new App({ verbose: migrationOptions.verbose });
+            }
+            
+            // Initialize database connection
+            await this.applicationService.initDatabase();
+            
+            // Run migrations
+            await this.applicationService.runMigrations(migrationOptions);
+            
+            if (migrationOptions.dryRun) {
+                console.log('\n✅ Dry run completed (no changes applied)');
+            } else {
+                console.log('\n✅ Migrations completed successfully');
+            }
+            
+        } catch (err) {
+            this.handleError(err, options.verbose);
+        }
+    }
+
+    /**
+     * Handle database rollback command
+     */
+    async handleDbRollbackCommand(options) {
+        try {
+            console.log('\n⏪ Database Rollback:');
+            console.log('─'.repeat(40));
+            
+            const rollbackOptions = {
+                step: options.step || 1,
+                target: options.target || null,
+                dryRun: options.dryRun || false,
+                verbose: options.verbose || false
+            };
+            
+            if (rollbackOptions.dryRun) {
+                console.log('🔍 DRY RUN MODE - No changes will be applied\n');
+            }
+            
+            if (!this.applicationService) {
+                this.applicationService = new App({ verbose: rollbackOptions.verbose });
+            }
+            
+            await this.applicationService.initDatabase();
+            await this.applicationService.rollbackMigrations(rollbackOptions);
+            
+            console.log('\n✅ Rollback completed successfully');
+            
+        } catch (err) {
+            this.handleError(err, options.verbose);
+        }
+    }
+
+    /**
+     * Handle database create migration command
+     */
+    async handleDbCreateCommand(name, options) {
+        try {
+            console.log('\n📝 Creating Migration:');
+            console.log('─'.repeat(40));
+            
+            const createOptions = {
+                name: name,
+                table: options.table || null,
+                template: options.template || 'create',
+                verbose: options.verbose || false
+            };
+            
+            if (!this.applicationService) {
+                this.applicationService = new App({ verbose: createOptions.verbose });
+            }
+            
+            const migrationPath = await this.applicationService.createMigration(createOptions);
+            
+            console.log(`\n✅ Migration created successfully:`);
+            console.log(`   📁 ${migrationPath}`);
+            console.log(`\n💡 Next steps:`);
+            console.log(`   1. Edit the migration file to define your schema`);
+            console.log(`   2. Run: xfix db migrate`);
+            
+        } catch (err) {
+            this.handleError(err, options.verbose);
+        }
+    }
+
+    /**
+     * Handle database status command
+     */
+    async handleDbStatusCommand(options) {
+        try {
+            console.log('\n📊 Migration Status:');
+            console.log('─'.repeat(40));
+            
+            if (!this.applicationService) {
+                this.applicationService = new App({ verbose: options.verbose || false });
+            }
+            
+            await this.applicationService.initDatabase();
+            await this.applicationService.showMigrationStatus(options.verbose || false);
+            
+        } catch (err) {
+            this.handleError(err, options.verbose);
+        }
+    }
+
+    /**
+     * Handle database reset command
+     */
+    async handleDbResetCommand(options) {
+        try {
+            console.log('\n🔄 Database Reset:');
+            console.log('─'.repeat(40));
+            
+            const resetOptions = {
+                seed: options.seed || false,
+                force: options.force || false,
+                verbose: options.verbose || false
+            };
+            
+            // Check for production confirmation
+            if (!resetOptions.force && process.env.NODE_ENV === 'production') {
+                console.error('\n❌ Cannot reset database in production without --force flag');
+                console.log('   Use: xfix db reset --force (if you really mean to do this)');
+                process.exit(1);
+            }
+            
+            if (!this.applicationService) {
+                this.applicationService = new App({ verbose: resetOptions.verbose });
+            }
+            
+            await this.applicationService.initDatabase();
+            await this.applicationService.resetMigrations(resetOptions);
+            
+            console.log('\n✅ Database reset completed successfully');
+            
+        } catch (err) {
+            this.handleError(err, options.verbose);
+        }
+    }
+
+    /**
+     * Handle database make seeder command
+     */
+    async handleDbMakeSeederCommand(name, options) {
+        try {
+            console.log('\n📝 Creating Seeder:');
+            console.log('─'.repeat(40));
+            
+            if (!this.applicationService) {
+                this.applicationService = new App({ verbose: options.verbose || false });
+            }
+            
+            const seederPath = await this.applicationService.createSeeder({
+                name: name,
+                verbose: options.verbose || false
+            });
+            
+            console.log(`\n✅ Seeder created successfully:`);
+            console.log(`   📁 ${seederPath}`);
+            console.log(`\n💡 Next steps:`);
+            console.log(`   1. Edit the seeder file to add your data`);
+            console.log(`   2. Run: xfix db seed`);
+            console.log(`   3. Or run specific seeder: xfix db seed --class ${name}`);
+            
+        } catch (err) {
+            this.handleError(err, options.verbose);
+        }
+    }
+
+    /**
+     * Handle database seed command
+     */
+    async handleDbSeedCommand(options) {
+        try {
+            console.log('\n🌱 Running Seeders:');
+            console.log('─'.repeat(40));
+            
+            const seedOptions = {
+                seederClass: options.class || null,
+                force: options.force || false,
+                verbose: options.verbose || false
+            };
+            
+            // Check for production confirmation
+            if (!seedOptions.force && process.env.NODE_ENV === 'production') {
+                console.error('\n❌ Cannot run seeders in production without --force flag');
+                console.log('   Use: xfix db seed --force (if you really mean to do this)');
+                process.exit(1);
+            }
+            
+            if (!this.applicationService) {
+                this.applicationService = new App({ verbose: seedOptions.verbose });
+            }
+            
+            await this.applicationService.initDatabase();
+            await this.applicationService.runSeeders(seedOptions);
+            
+            console.log('\n✅ Seeders completed successfully');
+            
+        } catch (err) {
+            this.handleError(err, options.verbose);
+        }
+    }
+
     /**
      * Display what operations will be performed
      */
@@ -383,6 +687,7 @@ class CliService {
         console.log('  deploy    Quick deployment shorthand');
         console.log('  obfuscate Obfuscation without deployment');
         console.log('  revert    Revert obfuscated files to originals');
+        console.log('  db        Database migration management');
         console.log('  dev       Development tools');
         
         console.log('\n🏴 Flags for "xfix run":');
@@ -400,6 +705,44 @@ class CliService {
         console.log('  xfix revert --php --verbose');
         console.log('  xfix dev generate controller UserController AdminController');
         console.log('');
+
+        console.log('\n🗄️  Database Migration System:');
+        console.log('─'.repeat(50));
+        console.log('\n📦 Migration Commands:');
+        console.log('  db migrate              Run pending migrations');
+        console.log('  db rollback             Rollback last migration(s)');
+        console.log('  db create <name>        Create a new migration file');
+        console.log('  db reset                Rollback all migrations and run fresh');
+        console.log('  db status               Show migration status');
+        console.log('\n🌱 Seeder Commands:');
+        console.log('  db seed                 Run database seeders');
+        console.log('  db generate:seeder <name>   Create a new seeder file');
+        console.log('\n🎯 Options:');
+        console.log('  --step <n>              Number of migrations to run/rollback');
+        console.log('  --target <name>         Rollback to specific migration');
+        console.log('  --dry-run               Preview changes without executing');
+        console.log('  --table <name>          Specify table name for migration');
+        console.log('  --template <type>       Migration template (create, alter)');
+        console.log('  --class <name>          Run specific seeder class');
+        console.log('  --seed                  Run seeders after reset');
+        console.log('  --force                 Force operation in production');
+        console.log('  --verbose               Show detailed output');
+        console.log('\n💡 Examples:');
+        console.log('  # Migrations');
+        console.log('  xfix db migrate --step 5');
+        console.log('  xfix db migrate --dry-run --verbose');
+        console.log('  xfix db rollback --step 2');
+        console.log('  xfix db rollback --target 20260429104650_create_users_table');
+        console.log('  xfix db create create_users_table --table users');
+        console.log('  xfix db create add_email_to_users --template alter --table users');
+        console.log('  xfix db reset --seed');
+        console.log('  xfix db status --verbose');
+        console.log('\n  # Seeders');
+        console.log('  xfix db seed');
+        console.log('  xfix db seed --class UserSeeder');
+        console.log('  xfix db seed --force --verbose');
+        console.log('  xfix db generate:seeder UserSeeder');
+        console.log('  xfix db generate:seeder ProductSeeder');
     }
 
     /**
