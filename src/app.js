@@ -90,7 +90,7 @@ class App {
 			clearCache: config.clearCache || false,
 			runComposer: config.runComposer || false,
 			verbose: this.options.verbose || config.verbose || false,
-			framework: config.framework || 'selfphp',
+			framework: config.framework || '',
 			clientId: config.clientId || process.env.CLIENT_ID || process.env.XFIX_CLIENT_ID,
 			apiKey: config.apiKey || process.env.API_KEY || process.env.XFIX_API_KEY,
 
@@ -1020,7 +1020,7 @@ class App {
 			this.validateConfig(config);
 
 			// Create Services - Make services ready available in production
-			if (!config?.framework) {
+			if (!config?.framework || config?.framework !== 'selfphp') {
 				this.createService({
 					name: 'MigrationRunner',
 					type: 'migration',
