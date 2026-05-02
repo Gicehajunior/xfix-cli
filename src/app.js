@@ -1079,7 +1079,18 @@ class App {
 			await this.cleanup(zip_path, config);
 
 			const duration = ((Date.now() - start_time) / 1000).toFixed(2);
+			
 			console.log(`\n✅ Deployment staged successfully in ${duration}s\n`);
+
+			// Revert back to originals if --secure || obfuscation flags 
+			// was applied
+			if (this.options.obfuscateJs || config.obfuscateJs) {
+				await this.revert_js_obfuscation();
+			}
+
+			if (this.options.obfuscatePhp || config.obfuscatePhp) { 
+				await this.revert_php_obfuscation();
+			}
 
 		} catch (error) { 
 			const zip_path = path.join(this.ROOT, 'deploy.zip');
