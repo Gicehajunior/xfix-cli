@@ -79,7 +79,7 @@ class App {
 			deployPath: config.deployPath,
 			branch: config.branch || 'develop',
 			version: config.version || process.env.APP_VERSION || '',
-			deployUrl: config.deployUrl ? config.deployUrl + '/v1/api/deploy' : null,
+			deployUrl: config.deployUrl ? config.deployUrl : null,
 			secure: this.options.secure || config.secure || false,
 			rejectUnauthorized: config.rejectUnauthorized || false,
 			maxRetries: config.maxRetries || 3,
@@ -90,6 +90,7 @@ class App {
 			clearCache: config.clearCache || false,
 			runComposer: config.runComposer || false,
 			verbose: this.options.verbose || config.verbose || false,
+			framework: config.framework || 'selfphp',
 			clientId: config.clientId || process.env.CLIENT_ID || process.env.XFIX_CLIENT_ID,
 			apiKey: config.apiKey || process.env.API_KEY || process.env.XFIX_API_KEY,
 
@@ -157,6 +158,7 @@ class App {
 		// Always ignore these files
 		ig.add([
 			'.git',
+			'.gitattributes',
 			'.updateignore',
 			'.xfixrc.json', 
 			'deploy.zip',
@@ -169,6 +171,25 @@ class App {
 			'vendor/**/[..*.*',         // Catches: vendor/../[..anything].astro, .ts, etc.
 			'vendor/**/[...*',           // Catches: vendor/.../[...anything].ext
 			'vendor/**/[...*.*',         // Catches: vendor/.../[...anything].astro, .ts, etc.
+			'node_modules/**/[..*',           // Catches: node_modules/../[..anything].ext
+			'node_modules/**/[..*.*',         // Catches: node_modules/../[..anything].astro, .ts, etc.
+			'node_modules/**/[...*',           // Catches: node_modules/.../[...anything].ext
+			'node_modules/**/[...*.*',         // Catches: node_modules/.../[...anything].astro, .ts, etc.
+			'node_modules/**/.gitattributes',
+			'node_modules/**/.gitignore',
+			'node_modules/**/.npmignore',
+			'node_modules/**/.eslintrc*',
+			'node_modules/**/test/**',
+			'node_modules/**/docs/**',
+			'node_modules/**/process.env.js',
+			'.env',
+			'.env.local',
+			'.env.production',
+			'.htaccess',
+			'.htpasswd',
+			'.git/',
+			'.svn/',
+			'.env.example'
 		]);
 
 		return ig;
@@ -999,11 +1020,13 @@ class App {
 			this.validateConfig(config);
 
 			// Create Services - Make services ready available in production
-			this.createService({
-				name: 'MigrationRunner',
-				type: 'migration',
-				verbose: this.options.verbose || false
-			});
+			if (!config?.framework) {
+				this.createService({
+					name: 'MigrationRunner',
+					type: 'migration',
+					verbose: this.options.verbose || false, 
+				});
+			}
 
 			// ============================================
 			// PRE-DEPLOYMENT: Obfuscation
