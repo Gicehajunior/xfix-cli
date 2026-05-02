@@ -308,7 +308,7 @@ class App {
 
 			if (currentBranch !== expectedBranch) {
 				throw new Error(
-					`❌ Branch mismatch. Expected "${expectedBranch}", but currently on "${currentBranch}"`
+					`Branch mismatch. Expected "${expectedBranch}", but currently on "${currentBranch}"`
 				);
 			}
 
@@ -318,7 +318,7 @@ class App {
 			if (error.message.includes('Branch mismatch')) {
 				throw error;
 			}
-			throw new Error('❌ Failed to validate git branch. Are you in a git repository?');
+			throw new Error('Failed to validate git branch. Are you in a git repository?');
 		}
 	}
 
@@ -400,9 +400,9 @@ class App {
 
 		} catch (error) {
 			if (error.name === 'AbortError') {
-				throw new Error('❌ Remote deployment staging request timed out after 5 minutes');
+				throw new Error('Remote deployment staging request timed out after 5 minutes');
 			}
-			throw new Error(`❌ Remote deployment staging failed: ${error.message}`);
+			throw new Error(`Remote deployment staging failed: ${error.message}`);
 		}
 	}
 
@@ -712,47 +712,6 @@ class App {
 				}
 			}
 		}
-	}
-
-	/**
-	 * Revert PHP files back to originals from backup
-	 */
-	async revert_php_obfuscation() {
-		const backupDir = path.join(this.ROOT, 'original_php_backup');
-
-		if (!fs.existsSync(backupDir)) {
-			console.log('⚠️  No backup found. Nothing to revert.');
-			return;
-		}
-
-		console.log('\n🔄 Reverting PHP files to original versions...');
-
-		const ig = this.loadIgnore();
-		const phpFiles = await this.scan_php_files_with_ignore(ig);
-
-		let reverted = 0;
-
-		for (const file of phpFiles) {
-			const originalPath = path.join(this.ROOT, file);
-			const backupPath = path.join(backupDir, file);
-
-			if (fs.existsSync(backupPath)) {
-				try {
-					await fs.copyFile(backupPath, originalPath);
-					reverted++;
-				} catch (error) {
-					if (this.options.verbose) {
-						console.error(`   ⚠️  Failed to revert ${file}: ${error.message}`);
-					}
-				}
-			}
-		}
-
-		console.log(`✅ Reverted ${reverted} files`);
-
-		// Clean up backup
-		await fs.remove(backupDir);
-		console.log('🧹 Cleaned up backup directory');
 	}
 
 	/**
@@ -1072,7 +1031,7 @@ class App {
 			console.log(`   Found ${stats.total} files: ${stats.included} included, ${stats.excluded} excluded`);
 
 			if (!allowedFiles.length) {
-				throw new Error('❌ No files to deploy. Check your .updateignore configuration.');
+				throw new Error('No files to deploy. Check your .updateignore configuration.');
 			}
 
 			// Create archive
@@ -1122,11 +1081,19 @@ class App {
 			const duration = ((Date.now() - start_time) / 1000).toFixed(2);
 			console.log(`\n✅ Deployment staged successfully in ${duration}s\n`);
 
-		} catch (error) {
-			console.error(`\n❌ Deployment failed: ${error.message}\n`);
-
+		} catch (error) { 
 			const zip_path = path.join(this.ROOT, 'deploy.zip');
 			await this.cleanup(zip_path, config);
+
+			// Revert back to originals if --secure || obfuscation flags 
+			// was applied
+			if (this.options.obfuscateJs || config.obfuscateJs) {
+				await this.revert_js_obfuscation();
+			}
+
+			if (this.options.obfuscatePhp || config.obfuscatePhp) { 
+				await this.revert_php_obfuscation();
+			}
 
 			throw error;
 		}
@@ -1148,7 +1115,7 @@ class App {
 				const js_dest = this.options.jsDestPath || config.jsDestPath || 'public/orig';
 
 				if (!fs.existsSync(js_src)) {
-					console.error(`❌ JavaScript source directory not found: ${js_src}`);
+					console.error(`JavaScript source directory not found: ${js_src}`);
 					throw new Error(`JavaScript source directory not found: ${js_src}`);
 				}
 
