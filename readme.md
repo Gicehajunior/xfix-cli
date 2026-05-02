@@ -228,10 +228,10 @@ Cleanup complete
 
 ## Server Setup
 
-The server must expose a POST endpoint:
+The server must expose a POST endpoint Like the following:
 
 ```
-POST /v1/api/deploy
+POST /api/v1/deploy
 ```
 
 ### Expected Responsibilities
