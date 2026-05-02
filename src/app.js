@@ -158,8 +158,7 @@ class App {
 		ig.add([
 			'.git',
 			'.updateignore',
-			'.xfixrc.json',
-			'node_modules',
+			'.xfixrc.json', 
 			'deploy.zip',
 			'.DS_Store',
 			'Thumbs.db',
