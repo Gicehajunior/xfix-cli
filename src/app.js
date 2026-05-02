@@ -1020,7 +1020,7 @@ class App {
 			this.validateConfig(config);
 
 			// Create Services - Make services ready available in production
-			if (!config?.framework || config?.framework !== 'selfphp') {
+			if (!config?.framework || config?.framework == 'selfphp') {
 				this.createService({
 					name: 'MigrationRunner',
 					type: 'migration',
