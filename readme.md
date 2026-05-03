@@ -195,6 +195,9 @@ xfix revert --all
 ```bash
 xfix dev generate controller UserController
 xfix dev generate controller UserController AdminController
+xfix dev generate service PaymentGateway EmailService
+xfix dev generate service MigrationRunner --type migration
+xfix dev generate service UserService RoleService PermissionService
 ```
 
 ## Deployment Flow
@@ -225,10 +228,10 @@ Cleanup complete
 
 ## Server Setup
 
-The server must expose a POST endpoint:
+The server must expose a POST endpoint Like the following:
 
 ```
-POST /v1/app/deploy
+POST /api/v1/deploy
 ```
 
 ### Expected Responsibilities

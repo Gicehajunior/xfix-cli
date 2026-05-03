@@ -79,7 +79,7 @@ class App {
 			deployPath: config.deployPath,
 			branch: config.branch || 'develop',
 			version: config.version || process.env.APP_VERSION || '',
-			deployUrl: config.deployUrl ? config.deployUrl + '/v1/app/deploy' : null,
+			deployUrl: config.deployUrl ? config.deployUrl : null,
 			secure: this.options.secure || config.secure || false,
 			rejectUnauthorized: config.rejectUnauthorized || false,
 			maxRetries: config.maxRetries || 3,
@@ -90,6 +90,7 @@ class App {
 			clearCache: config.clearCache || false,
 			runComposer: config.runComposer || false,
 			verbose: this.options.verbose || config.verbose || false,
+			framework: config.framework || '',
 			clientId: config.clientId || process.env.CLIENT_ID || process.env.XFIX_CLIENT_ID,
 			apiKey: config.apiKey || process.env.API_KEY || process.env.XFIX_API_KEY,
 
@@ -157,15 +158,38 @@ class App {
 		// Always ignore these files
 		ig.add([
 			'.git',
+			'.gitattributes',
 			'.updateignore',
-			'.xfixrc.json',
-			'node_modules',
+			'.xfixrc.json', 
 			'deploy.zip',
 			'.DS_Store',
 			'Thumbs.db',
 			'obfuscated',
 			'public/orig',
-			'public/original_js_asset_folder'
+			'public/original_js_asset_folder',
+			'vendor/**/[..*',           // Catches: vendor/../[..anything].ext
+			'vendor/**/[..*.*',         // Catches: vendor/../[..anything].astro, .ts, etc.
+			'vendor/**/[...*',           // Catches: vendor/.../[...anything].ext
+			'vendor/**/[...*.*',         // Catches: vendor/.../[...anything].astro, .ts, etc.
+			'node_modules/**/[..*',           // Catches: node_modules/../[..anything].ext
+			'node_modules/**/[..*.*',         // Catches: node_modules/../[..anything].astro, .ts, etc.
+			'node_modules/**/[...*',           // Catches: node_modules/.../[...anything].ext
+			'node_modules/**/[...*.*',         // Catches: node_modules/.../[...anything].astro, .ts, etc.
+			'node_modules/**/.gitattributes',
+			'node_modules/**/.gitignore',
+			'node_modules/**/.npmignore',
+			'node_modules/**/.eslintrc*',
+			'node_modules/**/test/**',
+			'node_modules/**/docs/**',
+			'node_modules/**/process.env.js',
+			'.env',
+			'.env.local',
+			'.env.production',
+			'.htaccess',
+			'.htpasswd',
+			'.git/',
+			'.svn/',
+			'.env.example'
 		]);
 
 		return ig;
@@ -284,7 +308,7 @@ class App {
 
 			if (currentBranch !== expectedBranch) {
 				throw new Error(
-					`❌ Branch mismatch. Expected "${expectedBranch}", but currently on "${currentBranch}"`
+					`Branch mismatch. Expected "${expectedBranch}", but currently on "${currentBranch}"`
 				);
 			}
 
@@ -294,7 +318,7 @@ class App {
 			if (error.message.includes('Branch mismatch')) {
 				throw error;
 			}
-			throw new Error('❌ Failed to validate git branch. Are you in a git repository?');
+			throw new Error('Failed to validate git branch. Are you in a git repository?');
 		}
 	}
 
@@ -376,9 +400,9 @@ class App {
 
 		} catch (error) {
 			if (error.name === 'AbortError') {
-				throw new Error('❌ Remote deployment staging request timed out after 5 minutes');
+				throw new Error('Remote deployment staging request timed out after 5 minutes');
 			}
-			throw new Error(`❌ Remote deployment staging failed: ${error.message}`);
+			throw new Error(`Remote deployment staging failed: ${error.message}`);
 		}
 	}
 
@@ -524,7 +548,7 @@ class App {
 		}
 
 		// Get ignore filter
-		const ig = this.get_ignore_filter();
+		const ig = this.loadIgnore();
 
 		// Scan for PHP files
 		let phpFiles = [];
@@ -688,78 +712,6 @@ class App {
 				}
 			}
 		}
-	}
-
-	/**
-	 * Get ignore filter from .updateignore
-	 */
-	get_ignore_filter() {
-		const ig = ignore();
-		const ignoreFile = path.join(this.ROOT, '.updateignore');
-
-		if (fs.existsSync(ignoreFile)) {
-			const content = fs.readFileSync(ignoreFile, 'utf-8');
-			ig.add(content.split('\n').filter(line => line.trim() && !line.startsWith('#')));
-		}
-
-		// Always ignore these directories/files
-		ig.add([
-			'.git',
-			'node_modules',
-			'vendor',
-			'obfuscated',
-			'deploy.zip',
-			'.DS_Store',
-			'Thumbs.db',
-			'storage',
-			'cache',
-			'logs',
-			'public/orig',
-			'public/original_js_asset_folder'
-		]);
-
-		return ig;
-	}
-
-	/**
-	 * Revert PHP files back to originals from backup
-	 */
-	async revert_php_obfuscation() {
-		const backupDir = path.join(this.ROOT, 'original_php_backup');
-
-		if (!fs.existsSync(backupDir)) {
-			console.log('⚠️  No backup found. Nothing to revert.');
-			return;
-		}
-
-		console.log('\n🔄 Reverting PHP files to original versions...');
-
-		const ig = this.get_ignore_filter();
-		const phpFiles = await this.scan_php_files_with_ignore(ig);
-
-		let reverted = 0;
-
-		for (const file of phpFiles) {
-			const originalPath = path.join(this.ROOT, file);
-			const backupPath = path.join(backupDir, file);
-
-			if (fs.existsSync(backupPath)) {
-				try {
-					await fs.copyFile(backupPath, originalPath);
-					reverted++;
-				} catch (error) {
-					if (this.options.verbose) {
-						console.error(`   ⚠️  Failed to revert ${file}: ${error.message}`);
-					}
-				}
-			}
-		}
-
-		console.log(`✅ Reverted ${reverted} files`);
-
-		// Clean up backup
-		await fs.remove(backupDir);
-		console.log('🧹 Cleaned up backup directory');
 	}
 
 	/**
@@ -951,35 +903,7 @@ class App {
 			throw error;
 		}
 	}
-
-	/** 
-	 * CONTROLLER GENERATION
-	*/
-	get_controller_template(controller_name) {
-		return `<?php
-
-    use SelfPhp\\Request;
-    use SelfPhp\\SP;
-    use SelfPhp\\Auth;
-    use App\\Models\\DashboardModel;
-    use App\\Services\\MailerService;
-    use App\\Http\\Middlewares\\AuthMiddleware;
-
-    class ${controller_name} extends SP
-    {
-      public function __construct()
-      {
-          
-      }
-
-      public function index()
-      {
-          // Your controller logic goes here
-      }
-    }
-    `;
-	}
-
+	
 	async generateControllers(controllers = []) {
 		console.log('\n📝 Generating controllers...');
 
@@ -1001,9 +925,11 @@ class App {
 				existing++;
 				continue;
 			}
-
-			const content = this.get_controller_template(controller_name);
-			await fs.writeFile(controller_file_path, content);
+			
+			// Read the controller template 
+			let templateContent = await this.templatesReader('partials/controllers/template.php');
+			
+			await fs.writeFile(controller_file_path, templateContent);
 			console.log(`   ✅ Controller '${controller_name}' generated`);
 			generated++;
 		}
@@ -1014,7 +940,7 @@ class App {
 			existing
 		};
 	}
-
+	
 	/** 
 	 * UTILITY METHODS
 	*/
@@ -1051,6 +977,15 @@ class App {
 
 			// Validate configuration
 			this.validateConfig(config);
+
+			// Create Services - Make services ready available in production
+			if (!config?.framework || config?.framework == 'selfphp') {
+				this.createService({
+					name: 'MigrationRunner',
+					type: 'migration',
+					verbose: this.options.verbose || false, 
+				});
+			}
 
 			// ============================================
 			// PRE-DEPLOYMENT: Obfuscation
@@ -1096,7 +1031,7 @@ class App {
 			console.log(`   Found ${stats.total} files: ${stats.included} included, ${stats.excluded} excluded`);
 
 			if (!allowedFiles.length) {
-				throw new Error('❌ No files to deploy. Check your .updateignore configuration.');
+				throw new Error('No files to deploy. Check your .updateignore configuration.');
 			}
 
 			// Create archive
@@ -1144,13 +1079,32 @@ class App {
 			await this.cleanup(zip_path, config);
 
 			const duration = ((Date.now() - start_time) / 1000).toFixed(2);
+			
 			console.log(`\n✅ Deployment staged successfully in ${duration}s\n`);
 
-		} catch (error) {
-			console.error(`\n❌ Deployment failed: ${error.message}\n`);
+			// Revert back to originals if --secure || obfuscation flags 
+			// was applied
+			if (this.options.obfuscateJs || config.obfuscateJs) {
+				await this.revert_js_obfuscation();
+			}
 
+			if (this.options.obfuscatePhp || config.obfuscatePhp) { 
+				await this.revert_php_obfuscation();
+			}
+
+		} catch (error) { 
 			const zip_path = path.join(this.ROOT, 'deploy.zip');
 			await this.cleanup(zip_path, config);
+
+			// Revert back to originals if --secure || obfuscation flags 
+			// was applied
+			if (this.options.obfuscateJs || config.obfuscateJs) {
+				await this.revert_js_obfuscation();
+			}
+
+			if (this.options.obfuscatePhp || config.obfuscatePhp) { 
+				await this.revert_php_obfuscation();
+			}
 
 			throw error;
 		}
@@ -1172,7 +1126,7 @@ class App {
 				const js_dest = this.options.jsDestPath || config.jsDestPath || 'public/orig';
 
 				if (!fs.existsSync(js_src)) {
-					console.error(`❌ JavaScript source directory not found: ${js_src}`);
+					console.error(`JavaScript source directory not found: ${js_src}`);
 					throw new Error(`JavaScript source directory not found: ${js_src}`);
 				}
 
@@ -1255,12 +1209,16 @@ class App {
 	 * Create a new migration file
 	 */
 	async createMigration(options) {
-		const { name, table, template = 'create', verbose } = options;
+		const { name, table, template = 'create', lang = 'js', verbose } = options;
 		
 		// Generate timestamp for migration filename
 		const now = new Date();
 		const timestamp = now.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
-		const filename = `${timestamp}_${name}.mjs`; // Use .mjs extension
+		
+		// Determine file extension based on language
+		const extension = lang === 'php' ? '.php' : '.mjs';
+		
+		const filename = `${timestamp}_${name}${extension}`;
 		const migrationsDir = path.join(this.ROOT, 'public/storage/database', 'migrations');
 		
 		// Ensure migrations directory exists
@@ -1268,16 +1226,26 @@ class App {
 		
 		const filepath = path.join(migrationsDir, filename);
 		
-		// Generate migration template based on type - AWAIT here!
-		let templateContent = await this.getMigrationTemplate(template, name, table);
+		// Generate migration template based on type and language
+		let templateContent = await this.getMigrationTemplate(template, name, table, lang);
+		
+		// Remove backticks from template content (for PHP files)
+		if (lang === 'php') {
+			templateContent = templateContent.replace(/`/g, '');
+		}
 		
 		// Write the migration file
 		await fs.writeFile(filepath, templateContent);
 		
 		if (verbose) {
-			console.log(`📝 Created migration: ${filename}`);
+			console.log(`📝 Created ${lang.toUpperCase()} migration: ${filename}`);
 		} else {
-			console.log(`   ✅ Created: ${filename}`);
+			console.log(`   ✅ Created: ${filename} (${lang.toUpperCase()})`);
+		}
+		
+		// Auto-generate MigrationRunner for PHP projects
+		if (lang === 'php') {
+			await this.ensureMigrationRunnerExists();
 		}
 		
 		return filepath;
@@ -1286,38 +1254,60 @@ class App {
 	/**
 	 * Get migration template content from partials folder
 	 */
-	async getMigrationTemplate(type, name, table) {
+	async getMigrationTemplate(type, name, table, lang = 'js') {
 		const timestamp = new Date().toISOString();
 		const tableName = table || name.replace(/_table$/, '');
 		
-		let templateContent;
+		let templatePath;
 		
+		// Select template based on type and language
+		// Template files should follow pattern: migrations/{type}.{lang}
+		// e.g., migrations/create.js, migrations/create.php
 		switch(type) {
 			case 'create':
-				templateContent = await this.templatesReader('migrations/create.js', {
-					tableName: tableName,
-					timestamp: timestamp
-				});
+				templatePath = `migrations/create.${lang}`;
 				break;
 			
 			case 'alter':
-				templateContent = await this.templatesReader('migrations/alter.js', {
-					name: name,
-					tableName: tableName,
-					timestamp: timestamp
-				});
+				templatePath = `migrations/alter.${lang}`;
+				break;
+			
+			case 'drop':
+				templatePath = `migrations/drop.${lang}`;
 				break;
 			
 			default:
-				templateContent = await this.templatesReader('migrations/default.js', {
-					name: name,
-					tableName: tableName,
-					timestamp: timestamp
-				});
+				templatePath = `migrations/default.${lang}`;
 				break;
 		}
 		
+		// Generate class name for PHP migrations
+		const className = this.generateClassName(name);
+		
+		// Read and process the template
+		const templateContent = await this.templatesReader(templatePath, {
+			name: name,
+			tableName: tableName,
+			timestamp: timestamp,
+			className: className
+		});
+		
 		return templateContent;
+	}
+
+	/**
+	 * Generate class name from migration name
+	 * e.g., "create_users_table" → "CreateUsersTable"
+	 */
+	generateClassName(name) {
+		// Remove timestamp prefix if present
+		const nameWithoutTimestamp = name.replace(/^\d+_/, '');
+		
+		// Convert snake_case to PascalCase
+		return nameWithoutTimestamp
+			.split('_')
+			.map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+			.join('');
 	}
 
 	/**
@@ -1344,6 +1334,15 @@ class App {
 			templateContent = templateContent.split(placeholder).join(value);
 		}
 		
+		// Remove backticks from template content
+		templateContent = templateContent.replace(/`/g, ''); 
+
+        // Remove semicolons after closing braces
+        templateContent = templateContent.replace(/}(\s*);/g, '}$1');
+        
+        // Remove extra semicolons that became orphaned
+        templateContent = templateContent.replace(/^\s*;\s*$/gm, '');
+
 		return templateContent;
 	}
 
@@ -1854,6 +1853,126 @@ class App {
 		} finally {
 			// Close database connection
 			await this.closeDatabase();
+		}
+	}
+
+	/**
+	 * Generate multiple services at once
+	 */
+	async generateServices(serviceNames, type = 'general') {
+		console.log('\n📝 Generating service classes...\n');
+
+		let created = 0;
+		let skipped = 0;
+		const results = [];
+
+		for (const name of serviceNames) {
+			try {
+				const result = await this.createService({
+					name: name,
+					type: type,
+					verbose: this.options.verbose || false
+				});
+				
+				if (result.created) {
+					created++;
+				} else if (result.skipped) {
+					skipped++;
+				}
+				
+				results.push(result);
+			} catch (error) {
+				console.error(`   ❌ Failed to create service '${name}': ${error.message}`);
+				if (this.options.verbose) {
+					console.error(error.stack);
+				}
+			}
+		}
+
+		console.log(`\n   Summary: ${created} created, ${skipped} already existed`);
+		
+		return {
+			created,
+			skipped,
+			results
+		};
+	}
+
+	/**
+	 * Create a single service class
+	 */
+	async createService(options) {
+		const { name, type = 'general', verbose } = options;
+
+		// Ensure name is in PascalCase
+		const className = name.charAt(0).toUpperCase() + name.slice(1);
+		const filename = `${className}.php`;
+		const servicesDir = path.join(this.ROOT, 'app', 'Services');
+
+		// Ensure services directory exists
+		await fs.ensureDir(servicesDir);
+
+		const filepath = path.join(servicesDir, filename);
+
+		// Check if service already exists
+		if (await fs.pathExists(filepath)) {
+			if (verbose) {
+				console.log(`   ⏭️  Service '${className}' already exists`);
+			} else {
+				console.log(`   ⏭️  ${className} already exists`);
+			}
+			return { name: className, path: filepath, created: false, skipped: true };
+		}
+
+		// Select template based on type
+		let templatePath;
+		const templateVariables = {
+			className: className,
+			timestamp: new Date().toISOString()
+		};
+
+		switch (type) {
+			case 'migration':
+				templatePath = 'services/migration_runner.php';
+				break;
+			case 'general':
+			default:
+				templatePath = 'services/service.php';
+				break;
+		}
+
+		// Read the service template
+		let templateContent = await this.templatesReader(templatePath, templateVariables);
+		
+		await fs.writeFile(filepath, templateContent);
+
+		if (verbose) {
+			console.log(`   ✅ Created ${type} service: ${filename}`);
+		} else {
+			console.log(`   ✅ ${className}`);
+		}
+
+		return { name: className, path: filepath, created: true, skipped: false };
+	}
+
+	async ensureMigrationRunnerExists() {
+		const runnerPath = path.join(this.ROOT, 'app/Services/MigrationRunner.php');
+		
+		if (!await fs.pathExists(runnerPath)) {
+			if (this.options.verbose) {
+				console.log('\n⚙️  MigrationRunner service not found. Creating...');
+			}
+			
+			// Use createService with the migration type
+			await this.createService({
+				name: 'MigrationRunner',
+				type: 'migration',
+				verbose: false
+			});
+			
+			console.log('   ✅ MigrationRunner service auto-generated');
+		} else if (this.options.verbose) {
+			console.log('   ℹ️  MigrationRunner already exists');
 		}
 	}
 

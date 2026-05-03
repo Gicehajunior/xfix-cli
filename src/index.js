@@ -45,7 +45,10 @@ class CliService {
             .option('--js-src <path>', 'JavaScript source directory', 'public/js')
             .option('--js-dest <path>', 'JavaScript destination directory', 'public/orig')
             .option('--generate-controllers <controllers>', 'Generate controllers (comma-separated, development only)')
+            .option('--generate-services <services>', 'Generate services (comma-separated, development only)')
             .option('--controllers <controllers>', 'Controllers to generate (alias for --generate-controllers)')
+            .option('--services <services>', 'Services to generate (alias for --generate-services)')
+            .option('--type <type>', 'Service type (general or migration)', 'general')
             .action(async (options) => {
                 await this.handleRunCommand(options);
             });
@@ -89,6 +92,16 @@ class CliService {
             .description('Generate one or more controllers')
             .action(async (controllers) => {
                 await this.handleControllerGeneration(controllers);
+            }); 
+
+        // Create command - generate new service
+        generateCommand
+            .command('service <name...>')
+            .description('Generate one or more controllers')
+            .option('--type <type>', 'Service type (general or migration)', 'general')
+            .option('--verbose', 'Enable verbose output')
+            .action(async (name, options) => {
+                await this.handleServiceGeneration(name, options);
             });
     }
 
@@ -236,6 +249,42 @@ class CliService {
     }
 
     /**
+     * Handle service generation
+     */
+    async handleServiceGeneration(services, options) {
+        try {
+            const serviceType = options.type || 'general';
+            
+            // Validation: migration type can only generate one service
+            if (serviceType === 'migration' && services.length > 1) {
+                console.error('\n❌ Cannot generate multiple migration services');
+                console.log('   Migration type only supports a single service');
+                console.log('   Usage: xfix dev generate service MigrationRunner --type migration');
+                return;
+            }
+            
+            console.log('\n⚙️  Generating Services:');
+            console.log('─'.repeat(40));
+            console.log(`   Type: ${serviceType === 'migration' ? 'Migration Runner' : 'General Service'}`);
+            console.log(`   Services: ${services.join(', ')}`);
+            console.log('');
+
+            const applicationService = new App({
+                verbose: options.verbose || false,
+                generateServices: true,
+                services: services,
+                serviceType: serviceType
+            });
+            
+            await applicationService.generateServices(services, serviceType);
+            
+            console.log('\n✅ Services generated successfully\n');
+        } catch (err) {
+            this.handleError(err, false);
+        }
+    }
+
+    /**
      * Parse and normalize run options
      */
     parseRunOptions(options) {
@@ -253,7 +302,13 @@ class CliService {
             controllers = controllerArg.split(',').map(c => c.trim()).filter(Boolean);
         }
 
-        return {
+        let services = [];
+        const serviceArg = options.generateServices || options.services;
+        if (serviceArg) {
+            services = serviceArg.split(',').map(c => c.trim()).filter(Boolean);
+        }
+
+        let finalOptions = {
             deploy: shouldDeploy,
             secure: isSecure,
             verbose: options.verbose || false,
@@ -265,8 +320,26 @@ class CliService {
             jsSrcPath: options.jsSrc || 'public/js',
             jsDestPath: options.jsDest || 'public/orig',
             generateControllers: controllers.length > 0,
-            controllers: controllers
-        };
+            controllers: controllers,
+            generateServices: services.length > 0,
+            type: options.type || 'general',
+            services: services
+        }
+
+        const serviceType = finalOptions.type || 'general';
+            
+        // Validation: migration type can only generate one service
+        if (serviceType === 'migration' && services.length > 1) {
+            console.error('\n❌ Cannot generate multiple migration services');
+            console.log('   Migration type only supports a single service');
+            console.log('   Usage: xfix dev generate service MigrationRunner --type migration');
+            console.log('   Usage: xfix dev generate service EmailGateway,ExportGateway,PaymentGateway');
+            console.log('   Usage: xfix run --generate-services MigrationRunner --type migration');
+            console.log('   OR:    xfix run --generate-services EmailGateway,ExportGateway,PaymentGateway');
+            return;
+        }
+        
+        return finalOptions;
     }
 
     /**
@@ -274,11 +347,13 @@ class CliService {
      */
     validateOptions(options) {
         // --generate-controllers cannot be used with --deploy
-        if (options.deploy && options.generateControllers) {
+        if (options.deploy && options.generateControllers && options.generateServices) {
             throw new Error(
                 '❌ Conflicting options: --generate-controllers cannot be used with --deploy\n' +
                 '   Controller generation is for development only.\n' +
                 '   Use: xfix run --generate-controllers ControllerName\n' +
+                '   Use: xfix run --generate-services ServiceName\n' +
+                '   Use: xfix dev generate controller ControllerName\n' +
                 '   Or:  xfix dev generate controller ControllerName'
             );
         }
@@ -290,17 +365,19 @@ class CliService {
         }
 
         // If no operations specified
-        if (!options.deploy && !options.obfuscateJs && !options.obfuscatePhp && !options.generateControllers) {
+        if (!options.deploy && !options.obfuscateJs && !options.obfuscatePhp && !options.generateControllers && !options.generateServices) {
             throw new Error(
                 '❌ No operations specified\n' +
                 '   Examples:\n' +
-                '     xfix run --deploy                          # Simple deployment\n' +
-                '     xfix run --deploy --secure                 # Secure deployment with full obfuscation\n' +
-                '     xfix run --deploy --obfuscate-js           # Deploy with JS obfuscation\n' +
-                '     xfix run --obfuscate-js                    # Obfuscate JS only (no deploy)\n' +
-                '     xfix run --generate-controllers User,Admin # Generate controllers\n' +
-                '     xfix obfuscate --all                       # Obfuscate everything\n' +
-                '     xfix dev generate controller User          # Generate a controller'
+                '     xfix run --deploy                                          # Simple deployment\n' +
+                '     xfix run --deploy --secure                                 # Secure deployment with full obfuscation\n' +
+                '     xfix run --deploy --obfuscate-js                           # Deploy with JS obfuscation\n' +
+                '     xfix run --obfuscate-js                                    # Obfuscate JS only (no deploy)\n' +
+                '     xfix run --generate-controllers User,Admin                 # Generate controllers\n' +
+                '     xfix run --generate-services PaymentGateway,MailingGateway # Generate services\n' +
+                '     xfix obfuscate --all                                       # Obfuscate everything\n' +
+                '     xfix dev generate controller User                          # Generate a controller\n' +
+                '     xfix dev generate service User                             # Generate a service'
             );
         }
 
@@ -336,12 +413,14 @@ class CliService {
                 await this.handleDbRollbackCommand(options);
             });
     
-        // Create command - generate new migration
+        // Create command - generate new migration 
         dbCommand
             .command('create <name>')
             .description('Create a new migration file')
             .option('--table <name>', 'Specify table name for the migration')
             .option('--template <type>', 'Migration template type (create, alter, drop)', 'create')
+            .option('--lang <language>', 'Migration language (js or php)', 'js')
+            .option('--verbose', 'Enable verbose output')
             .action(async (name, options) => {
                 await this.handleDbCreateCommand(name, options);
             });
@@ -464,13 +543,25 @@ class CliService {
      */
     async handleDbCreateCommand(name, options) {
         try {
+            const lang = options.lang || 'js';
+            
+            // Validate language
+            const supportedLangs = ['js', 'php'];
+            if (!supportedLangs.includes(lang)) {
+                console.error(`\n❌ Unsupported language: ${lang}`);
+                console.log(`   Supported languages: ${supportedLangs.join(', ')}`);
+                return;
+            }
+            
             console.log('\n📝 Creating Migration:');
             console.log('─'.repeat(40));
+            console.log(`   Language: ${lang.toUpperCase()}`);
             
             const createOptions = {
                 name: name,
                 table: options.table || null,
                 template: options.template || 'create',
+                lang: lang,
                 verbose: options.verbose || false
             };
             
@@ -484,7 +575,14 @@ class CliService {
             console.log(`   📁 ${migrationPath}`);
             console.log(`\n💡 Next steps:`);
             console.log(`   1. Edit the migration file to define your schema`);
-            console.log(`   2. Run: xfix db migrate`);
+            
+            if (lang === 'php') {
+                console.log(`   2. The migration will run automatically during deployment`);
+                console.log(`   3. Or run manually via your MigrationRunner service`);
+            } else {
+                console.log(`   2. Run: xfix db migrate`);
+                console.log(`   3. Rollback: xfix db rollback`);
+            }
             
         } catch (err) {
             this.handleError(err, options.verbose);
@@ -643,6 +741,13 @@ class CliService {
             console.log('   ℹ️  Development mode only');
         }
 
+        // Service Generation
+        if (options.generateServices) {
+            console.log('📝 Service Generation:');
+            options.services.forEach(c => console.log(`   • ${c}`));
+            console.log('   ℹ️  Development mode only');
+        }
+
         // Operation mode
         if (!options.deploy && (options.obfuscateJs || options.obfuscatePhp)) {
             console.log('ℹ️  Mode: Obfuscation only (no deployment)');
@@ -662,6 +767,9 @@ class CliService {
         } else if (options.generateControllers) {
             // Controller generation only
             await this.applicationService.generateControllers(options.controllers);
+        } else if (options.generateServices) {
+            // Controller generation only
+            await this.applicationService.generateServices(options.services);
         } else if (options.obfuscateJs || options.obfuscatePhp) {
             // Obfuscation only
             await this.applicationService.obfuscateOnly();
@@ -697,13 +805,32 @@ class CliService {
         console.log('  --obfuscate-js        Obfuscate JavaScript only');
         console.log('  --obfuscate-php       Obfuscate PHP only');
         console.log('  --generate-controllers <names>  Generate controllers (dev only)');
+        console.log('  --generate-services <names>  Generate services (dev only)');
         console.log('  --verbose             Show detailed output');
+
+        console.log('\n⚙️  Development Commands:');
+        console.log('  dev generate controller <names...>           Generate one or more controllers');
+        console.log('  dev generate service <names...>              Generate one or more service classes');
+        console.log('  dev generate service <name> --type migration Generate migration runner');
         
         console.log('\n💡 Examples:');
+        console.log('  #General:');
         console.log('  xfix run --deploy --secure --verbose');
         console.log('  xfix obfuscate --js --verbose');
         console.log('  xfix revert --php --verbose');
         console.log('  xfix dev generate controller UserController AdminController');
+        console.log('  xfix dev generate service User Admin');
+        console.log('  ');
+        console.log('  # Controllers');
+        console.log('  xfix dev generate controller UserController AdminController');
+        console.log('  ');
+        console.log('  # Services');
+        console.log('  xfix dev generate service PaymentGateway EmailService');
+        console.log('  xfix dev generate service MigrationRunner --type migration');
+        console.log('  ');
+        console.log('  # Multiple services (general only)');
+        console.log('  xfix dev generate service UserService RoleService PermissionService');
+        
         console.log('');
 
         console.log('\n🗄️  Database Migration System:');
@@ -714,9 +841,11 @@ class CliService {
         console.log('  db create <name>        Create a new migration file');
         console.log('  db reset                Rollback all migrations and run fresh');
         console.log('  db status               Show migration status');
+
         console.log('\n🌱 Seeder Commands:');
         console.log('  db seed                 Run database seeders');
         console.log('  db generate:seeder <name>   Create a new seeder file');
+        
         console.log('\n🎯 Options:');
         console.log('  --step <n>              Number of migrations to run/rollback');
         console.log('  --target <name>         Rollback to specific migration');
@@ -727,16 +856,33 @@ class CliService {
         console.log('  --seed                  Run seeders after reset');
         console.log('  --force                 Force operation in production');
         console.log('  --verbose               Show detailed output');
+
         console.log('\n💡 Examples:');
         console.log('  # Migrations');
+        console.log('  xfix db create <name>              Create a new migration');
+        console.log('  xfix db create <name> --lang php   Create a PHP migration');
+        console.log('  xfix db create <name> --table <t>  Specify table name');
+        console.log('  xfix db create <name> --template <type>  Template type (create, alter, drop)');
         console.log('  xfix db migrate --step 5');
         console.log('  xfix db migrate --dry-run --verbose');
         console.log('  xfix db rollback --step 2');
-        console.log('  xfix db rollback --target 20260429104650_create_users_table');
-        console.log('  xfix db create create_users_table --table users');
-        console.log('  xfix db create add_email_to_users --template alter --table users');
+        console.log('  xfix db rollback --target 20260429104650_create_users_table'); 
         console.log('  xfix db reset --seed');
         console.log('  xfix db status --verbose');
+
+        console.log('\n💡 Examples:');
+        console.log('  # JavaScript migrations (default)');
+        console.log('  xfix db create create_users_table --table users');
+        console.log('  xfix db create add_email_to_users --template alter --table users');
+        console.log('  xfix db create create_users_table --lang js --table users');
+        console.log('  ');
+        console.log('  # PHP migrations');
+        console.log('  xfix db create create_users_table --lang php --table users');
+        console.log('  xfix db create add_email_to_users --lang php --template alter --table users');
+        console.log('  xfix db create drop_old_table --lang php --template drop --table old_table');
+        
+        console.log('');
+
         console.log('\n  # Seeders');
         console.log('  xfix db seed');
         console.log('  xfix db seed --class UserSeeder');
