@@ -30,6 +30,8 @@ class App {
 		this.git = simpleGit(this.ROOT);
 		this.LAST_DEPLOY_FILE = path.join(this.ROOT, '.last-deploy');
 
+		this.config = {};
+
 		this.options = {
 			// Deployment options
 			deploy: false,
@@ -95,6 +97,7 @@ class App {
 			runComposer: config.runComposer || false,
 			verbose: this.options.verbose || config.verbose || false,
 			framework: config.framework || '',
+			exclusiveFiles: config.exclude || [],
 			clientId: config.clientId || process.env.CLIENT_ID || process.env.XFIX_CLIENT_ID,
 			apiKey: config.apiKey || process.env.API_KEY || process.env.XFIX_API_KEY,
 
@@ -150,7 +153,9 @@ class App {
 	/** 
 	 * FILE & IGNORE METHODS
 	*/
-	loadIgnore() {
+	async loadIgnore() {
+		this.config = await this.loadConfig();
+
 		const ig = ignore();
 		const ignoreFile = path.join(this.ROOT, '.updateignore');
 
@@ -160,7 +165,7 @@ class App {
 		}
 
 		// Always ignore these files
-		ig.add([
+		let exclusives = [
 			'.git',
 			'.last-deploy',
 			'.gitattributes',
@@ -195,8 +200,20 @@ class App {
 			'.git/',
 			'.svn/',
 			'.env.example'
-		]);
+		];
 
+		if (this.config?.exclusiveFiles?.length) {
+			this.config.exclusiveFiles.forEach(file => {
+				exclusives.push(file);
+
+				if (this.config?.verbose) {
+					console.log(`  ⏭️  Added: ${file} to the ignore stack`);
+				}
+			});
+		}
+
+		ig.add(exclusives);
+		
 		return ig;
 	}
 
@@ -377,20 +394,24 @@ class App {
 		}
 	}
 
-	filterGitChanges(changes, ig, config) {
-		const filtered = changes.filter(change => {
-			const rel = change.file.replace(/\\/g, '/');
+	filterFiles(files, ig, config) {
+		const filtered = files.filter((changedFile) => {
+			let rel = path.relative(this.ROOT, changedFile);
+			if (!this.options.obfuscateJs || !config.obfuscateJs || !this.options.obfuscatePhp || !config.obfuscatePhp) {
+				rel = changedFile.file.replace(/\\/g, '/'); 
+			}
+
 			const isIgnored = ig.ignores(rel);
-	
+
 			if (config.verbose && isIgnored) {
 				console.log(`  ⏭️  Ignored: ${rel}`);
 			}
-	
+
 			return !isIgnored;
-		});
-	
+		}); 
+
 		return filtered;
-	} 
+	}
 
 	/** 
 	 * ARCHIVE METHODS
@@ -695,7 +716,7 @@ class App {
 		}
 
 		// Get ignore filter
-		const ig = this.loadIgnore();
+		const ig = await this.loadIgnore();
 
 		// Scan for PHP files
 		let phpFiles = [];
@@ -1156,6 +1177,14 @@ class App {
 				await this.obfuscatePhp();
 			}
 
+			let secure = false;
+			if (this.options.obfuscateJs || 
+				config.obfuscateJs || 
+				this.options.obfuscatePhp || 
+				config.obfuscatePhp) {
+				secure = true;
+			}
+
 			// ============================================
 			// DEPLOYMENT PIPELINE
 			// ============================================
@@ -1165,14 +1194,26 @@ class App {
 
 			// Scan and filter files
 			console.log('\n📦 Scanning project files...');
-			const ig = this.loadIgnore(); 
-			const changes = await this.getUpdatedFiles(config);
-			const filtered = this.filterGitChanges(changes, ig, config);
+			const ig = await this.loadIgnore(); 
+			
+			let files = await this.getUpdatedFiles(config); 
+			if (secure) {
+				// since secured files should not be commited
+				if (this.config?.verbose) {
+					console.log(`  ⏭️  Since you are using secure mode, full application scope compilation is going to be targeted...`);
+				}
 
-			// Extract file paths from change objects
-			const filePaths = filtered.map(change => change.fullPath);
+				files = await this.getAllFiles(); 
+			}
 
-			const total = changes.length;
+			let filePaths = this.filterFiles(files, ig, config);
+
+			// Extract file paths from change objects 
+			if (!secure) {
+				filePaths = filtered.map(change => change.fullPath);
+			}
+
+			const total = files.length;
 			const included = filePaths.length;
 			const excluded = total - included;
 
