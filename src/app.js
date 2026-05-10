@@ -44,6 +44,13 @@ class App {
 			onlyObfuscate: false,
 			preserveOriginal: false,
 
+			// Deploy options
+			includeDependencies: false,
+			includeUnstaged: false,
+			includeUntracked: false,
+			fullDeployment: false,
+			stagedOnly: false,
+
 			// Path options
 			jsSrcPath: 'public/js',
 			jsDestPath: 'public/orig',
@@ -64,6 +71,58 @@ class App {
 			...options
 		};
 	}
+	
+	/**
+	 * Logging helper for consistent verbose output
+	 * 
+	 * @param {string} message - The message to log
+	 * @param {boolean} isVerbose - Whether this is a verbose-only message
+	 * @param {string} type - Message type for icon prefix (info, success, error, warn, skip, progress, deploy, lock, archive, upload, db, git, clean, revert, template, controller, service)
+	 */
+	log(message, isVerbose = false, type = 'info') {
+		if (!isVerbose || (isVerbose && this.config?.verbose)) {
+			const icons = {
+				space: '',
+				info: 'ℹ️',
+				success: '✅',
+				error: '❌',
+				warn: '⚠️',
+				skip: '⏭️',
+				progress: '⏳',
+				deploy: '🚀',
+				lock: '🔒',
+				archive: '📦',
+				upload: '📤',
+				db: '🗄️',
+				git: '📊',
+				clean: '🧹',
+				revert: '🔄',
+				template: '📝',
+				controller: '🎮',
+				service: '⚙️',
+				migration: '🔄',
+				seeder: '🌱',
+				scan: '🔍',
+				connect: '🔗',
+				trigger: '🛠️',
+				backup: '💾',
+				file: '📄',
+				folder: '📁',
+				js: '📜',
+				php: '🐘'
+			};
+			
+			        
+			const icon = icons[type] || '';
+			const trimmedMessage = message.trim();
+			
+			if (icon) {
+				console.log(` ${icon} ${trimmedMessage}`);
+			} else {
+				console.log(`   ${trimmedMessage}`);
+			}
+		}
+	}
 
 	/** 
 	 * CONFIGURATION METHODS
@@ -72,7 +131,7 @@ class App {
 		const configPath = path.join(this.ROOT, '.xfixrc.json');
 
 		if (!(await fs.pathExists(configPath))) {
-			throw new Error('❌ Configuration file .xfixrc.json not found in project root');
+			throw new Error('Configuration file .xfixrc.json not found in project root');
 		}
 
 		const config = await fs.readJson(configPath);
@@ -141,13 +200,13 @@ class App {
 
 		if (missing.length) {
 			throw new Error(
-				`❌ Missing required configuration fields: ${missing.join(', ')}`
+				`Missing required configuration fields: ${missing.join(', ')}`
 			);
 		}
 
 		if (config.password === 'your-password-here') {
 			throw new Error(
-				'❌ Please update the default password in .xfixrc.json or set DEPLOY_PASSWORD environment variable'
+				'Please update the default password in .xfixrc.json or set DEPLOY_PASSWORD environment variable'
 			);
 		}
 	}
@@ -155,7 +214,7 @@ class App {
 	/** 
 	 * FILE & IGNORE METHODS
 	*/
-	loadIgnore() { 
+	loadIgnore(includeDependencies = false) { 
 		const ig = ignore();
 		const ignoreFile = path.join(this.ROOT, '.updateignore');
 
@@ -177,21 +236,6 @@ class App {
 			'obfuscated',
 			'public/orig',
 			'public/original_js_asset_folder',
-			'vendor/**/[..*',           // Catches: vendor/../[..anything].ext
-			'vendor/**/[..*.*',         // Catches: vendor/../[..anything].astro, .ts, etc.
-			'vendor/**/[...*',           // Catches: vendor/.../[...anything].ext
-			'vendor/**/[...*.*',         // Catches: vendor/.../[...anything].astro, .ts, etc.
-			'node_modules/**/[..*',           // Catches: node_modules/../[..anything].ext
-			'node_modules/**/[..*.*',         // Catches: node_modules/../[..anything].astro, .ts, etc.
-			'node_modules/**/[...*',           // Catches: node_modules/.../[...anything].ext
-			'node_modules/**/[...*.*',         // Catches: node_modules/.../[...anything].astro, .ts, etc.
-			'node_modules/**/.gitattributes',
-			'node_modules/**/.gitignore',
-			'node_modules/**/.npmignore',
-			'node_modules/**/.eslintrc*',
-			'node_modules/**/test/**',
-			'node_modules/**/docs/**',
-			'node_modules/**/process.env.js',
 			'.env',
 			'.env.local',
 			'.env.production',
@@ -199,17 +243,387 @@ class App {
 			'.htpasswd',
 			'.git/',
 			'.svn/',
-			'.env.example'
+			'.env.example',
+
+			// harmful/unneccessary files
+			'vendor/**/[..*',
+			'vendor/**/[..*.*',
+			'vendor/**/[...*',
+			'vendor/**/[...*.*',
+			'node_modules/**/[..*',
+			'node_modules/**/[..*.*',
+			'node_modules/**/[...*',
+			'node_modules/**/[...*.*',
+			'node_modules/**/.gitattributes',
+			'node_modules/**/.gitignore',
+			'node_modules/**/.npmignore',
+			'node_modules/**/.eslintrc*',
+			'node_modules/**/test/**',
+			'node_modules/**/docs/**',
+			'node_modules/**/process.env.js'
 		];
+
+		// Conditionally ignore vendor and node_modules
+		if (!includeDependencies) {
+			exclusives.push(
+				'vendor',
+				'node_modules'
+			);
+		}
 
 		ig.add(exclusives);
 		
 		return ig;
 	}
 
+	async updateDeployMarker() {
+		const hash = (await this.git.revparse(['HEAD'])).trim();
+		await fs.writeFile(this.LAST_DEPLOY_FILE, hash);
+	}
+
+	filterFiles(files, ig) {
+		const filtered = [];
+		const excluded = [];
+	
+		files.forEach((changedFile) => {
+			let rel;
+			
+			// Handle both string paths and change objects
+			if (typeof changedFile === 'string') {
+				rel = path.relative(this.ROOT, changedFile);
+			} else {
+				// Extract relative path from change object
+				rel = changedFile.file || path.relative(this.ROOT, changedFile.fullPath);
+			}
+	
+			const isIgnored = ig.ignores(rel);
+
+			if (isIgnored) {
+				excluded.push(rel);
+				this.log(`  Skipped (filtered & ignored): ${rel}`, true);
+			} else {
+				filtered.push(changedFile);
+			}
+		});
+	
+		return {
+			filtered,
+			excluded
+		};
+	}
+
+	async getUpdatedFiles(config, options = {}) {
+		const {
+			includeUnstaged = false,
+			includeUntracked = false,
+			stagedOnly = false,
+			includeCommitted = true
+		} = options;
+	
+		let lastDeploy = null;
+	
+		if (await fs.pathExists(this.LAST_DEPLOY_FILE)) {
+			lastDeploy = (await fs.readFile(this.LAST_DEPLOY_FILE, 'utf-8')).trim();
+		}
+	
+		// First deploy - all tracked files (only for non-secure mode)
+		if (!lastDeploy && includeCommitted) {
+			try {
+				const files = await this.git.raw(['ls-files']);
+				const changes = files
+					.trim()
+					.split('\n')
+					.filter(Boolean)
+					.map(f => ({
+						status: 'A',
+						file: f,
+						fullPath: path.join(this.ROOT, f),
+						committed: true,
+						staged: true
+					}));
+	
+				this.options.total = changes.length;
+				this.options.included = changes.length;
+				this.options.excluded = 0;
+	
+				return changes;
+			} catch (error) {
+				throw new Error(`Failed to get initial file list: ${error.message}`);
+			}
+		}
+	
+		try {
+			let allChanges = [];
+	
+			// Get committed changes if requested
+			if (includeCommitted && lastDeploy) {
+				const diffArgs = stagedOnly ? ['--cached'] : [];
+				const diff = await this.git.diff([
+					'--name-status',
+					'--diff-filter=ACMRT',
+					...diffArgs,
+					`${lastDeploy}..HEAD`
+				]);
+				
+				const committedChanges = this.parseDiffOutput(diff, { 
+					committed: true,
+					staged: true 
+				});
+				
+				allChanges.push(...committedChanges);
+			}
+	
+			// Get unstaged changes if requested
+			if (includeUnstaged) {
+				const unstagedChanges = await this.getUnstagedChanges();
+				allChanges.push(...unstagedChanges);
+			}
+	
+			// Get untracked files if requested
+			if (includeUntracked) {
+				const untrackedFiles = await this.getUntrackedFiles();
+				allChanges.push(...untrackedFiles);
+			}
+	
+			// Remove duplicates (a file might be both staged and unstaged)
+			allChanges = this.deduplicateChanges(allChanges);
+	
+			// Warn if no changes detected
+			if (allChanges.length === 0 && config.verbose) {
+				this.log('  No changes detected with current options', true, 'info');
+			}
+	
+			// Update stats and display
+			this.updateChangeStats(allChanges, config);
+			
+			return allChanges;
+	
+		} catch (error) {
+			if (error.message.includes('unknown revision')) {
+				throw new Error(
+					`Deploy marker references invalid commit: ${lastDeploy}\n` +
+					'Try deleting .last-deploy file for full deployment'
+				);
+			}
+			throw error;
+		}
+	}
+	
+	/**
+	 * Remove duplicate file entries, preferring unstaged versions
+	 */
+	deduplicateChanges(changes) {
+		const fileMap = new Map();
+		
+		changes.forEach(change => {
+			const key = change.file;
+			
+			if (!fileMap.has(key)) {
+				fileMap.set(key, change);
+			} else {
+				// Prefer unstaged/untracked versions over committed
+				const existing = fileMap.get(key);
+				if (change.staged === false || change.untracked) {
+					fileMap.set(key, change);
+				}
+			}
+		});
+		
+		return Array.from(fileMap.values());
+	}
+	
+	/**
+	 * Get unstaged changes in working directory
+	 */
+	async getUnstagedChanges() {
+		const status = await this.git.status();
+		const changes = [];
+	
+		// Modified but not staged
+		status.modified.forEach(file => {
+			changes.push({
+				status: 'M',
+				file,
+				fullPath: path.join(this.ROOT, file),
+				staged: false,
+				committed: false
+			});
+		});
+	
+		// Deleted but not staged
+		status.deleted.forEach(file => {
+			changes.push({
+				status: 'D',
+				file,
+				fullPath: path.join(this.ROOT, file),
+				staged: false,
+				committed: false
+			});
+		});
+	
+		// Renamed in working directory
+		if (status.renamed) {
+			status.renamed.forEach(rename => {
+				changes.push({
+					status: 'R',
+					oldFile: rename.from,
+					file: rename.to,
+					fullPath: path.join(this.ROOT, rename.to),
+					staged: false,
+					committed: false
+				});
+			});
+		}
+	
+		return changes;
+	}
+	
+	/**
+	 * Get untracked files
+	 */
+	async getUntrackedFiles() {
+		const untracked = await this.git.raw([
+			'ls-files',
+			'--others',
+			'--exclude-standard'
+		]);
+	
+		return untracked
+			.trim()
+			.split('\n')
+			.filter(Boolean)
+			.map(file => ({
+				status: 'A',
+				file,
+				fullPath: path.join(this.ROOT, file),
+				untracked: true,
+				committed: false,
+				staged: false
+			}));
+	}
+	
+	/**
+	 * Parse git diff output
+	 */
+	parseDiffOutput(diff, metadata = {}) {
+		return diff
+			.trim()
+			.split('\n')
+			.filter(Boolean)
+			.map(line => {
+				const parts = line.split('\t');
+				const status = parts[0];
+	
+				// Handle renames (R100, R050, etc.)
+				if (status?.startsWith('R')) {
+					const similarity = status.substring(1);
+					const newFile = parts[2];
+	
+					if (!newFile) return null;
+	
+					return {
+						status: 'R',
+						similarity,
+						oldFile: parts[1],
+						file: newFile,
+						fullPath: path.join(this.ROOT, newFile),
+						...metadata
+					};
+				}
+	
+				// Handle copies
+				if (status?.startsWith('C')) {
+					const similarity = status.substring(1);
+					const newFile = parts[2];
+	
+					if (!newFile) return null;
+	
+					return {
+						status: 'C',
+						similarity,
+						oldFile: parts[1],
+						file: newFile,
+						fullPath: path.join(this.ROOT, newFile),
+						...metadata
+					};
+				}
+	
+				// Handle type changes
+				if (status?.startsWith('T')) {
+					const file = parts[1];
+					if (!file || typeof file !== 'string') return null;
+					
+					return {
+						status: 'T',
+						file,
+						fullPath: path.join(this.ROOT, file),
+						...metadata
+					};
+				}
+	
+				const file = parts[1];
+	
+				if (!file || typeof file !== 'string') return null;
+	
+				return {
+					status,
+					file,
+					fullPath: path.join(this.ROOT, file),
+					...metadata
+				};
+			})
+			.filter(Boolean);
+	}
+	
+	/**
+	 * Update change statistics and display
+	 */
+	updateChangeStats(changes, config) {
+		if (config.verbose) {
+			const statusCounts = {};
+			
+			changes.forEach(change => {
+				let key = change.status;
+				
+				if (change.untracked) {
+					key = 'Untracked';
+				} else if (change.staged === false) {
+					key = `${change.status} (unstaged)`;
+				} else if (change.committed) {
+					key = `${change.status} (committed)`;
+				}
+				
+				statusCounts[key] = (statusCounts[key] || 0) + 1;
+			});
+	
+			this.log('Git detected changes:', false, 'git');
+			Object.entries(statusCounts).forEach(([status, count]) => {
+				const statusLabel = {
+					'A (committed)': 'Added (committed)',
+					'M (committed)': 'Modified (committed)',
+					'D (committed)': 'Deleted (committed)',
+					'R (committed)': 'Renamed (committed)',
+					'C (committed)': 'Copied (committed)',
+					'T (committed)': 'Type Changed (committed)',
+					'A (unstaged)': 'Added (unstaged)',
+					'M (unstaged)': 'Modified (unstaged)',
+					'D (unstaged)': 'Deleted (unstaged)',
+					'R (unstaged)': 'Renamed (unstaged)',
+					'Untracked': 'New/Untracked'
+				}[status] || status;
+				this.log(`${statusLabel}: ${count} files`);
+			});
+		}
+	
+		// Update stats
+		this.options.total = changes.length;
+		this.options.included = changes.filter(c => c.status !== 'D').length;
+		this.options.excluded = changes.filter(c => c.status === 'D').length;
+	}
+
 	async getAllFiles(dir = this.ROOT, depth = 0, maxDepth = 50) {
 		if (depth > maxDepth) {
-			throw new Error(`❌ Maximum directory depth (${maxDepth}) exceeded at: ${dir}`);
+			throw new Error(`Maximum directory depth (${maxDepth}) exceeded at: ${dir}`);
 		}
 
 		const entries = await fs.readdir(dir, {
@@ -231,176 +645,388 @@ class App {
 		return files.flat();
 	}
 
-	async updateDeployMarker() {
-		const hash = (await this.git.revparse(['HEAD'])).trim();
-		await fs.writeFile(this.LAST_DEPLOY_FILE, hash);
-	}
+	/**
+	 * Get files for deployment based on mode and options
+	 */
+	async getDeploymentFiles(config, ig) {
+		let files;
+		
+		const isSecure = this.options.obfuscateJs || 
+						config.obfuscateJs || 
+						this.options.obfuscatePhp || 
+						config.obfuscatePhp;
 
-	async getUpdatedFiles(config) {
-		let lastDeploy = null;
-	
-		if (await fs.pathExists(this.LAST_DEPLOY_FILE)) {
-			lastDeploy = (await fs.readFile(this.LAST_DEPLOY_FILE, 'utf-8')).trim();
-		}
-	
-		// First deploy - all tracked files
-		if (!lastDeploy) {
-			try {
-				const files = await this.git.raw(['ls-files']);
-				const changes = files
-					.trim()
-					.split('\n')
-					.filter(Boolean)
-					.map(f => ({
-						status: 'A',
-						file: f,
-						fullPath: path.join(this.ROOT, f)
-					}));
-	
-				this.options.total = changes.length;
-				this.options.included = changes.length;
-				this.options.excluded = 0;
-	
-				return changes;
-			} catch (error) {
-				throw new Error(`Failed to get initial file list: ${error.message}`);
-			}
-		}
-	
-		try {
-			// Git diff with enhanced options
-			const diff = await this.git.diff([
-				'--name-status',
-				'--diff-filter=ACMR',
-				`${lastDeploy}..HEAD`
-			]);
-	
-			const changes = diff
-				.trim()
-				.split('\n')
-				.filter(Boolean)
-				.map(line => {
-					const parts = line.split('\t');
-					const status = parts[0];
-	
-					// Handle renames (R100, R050, etc.)
-					if (status?.startsWith('R')) {
-						const similarity = status.substring(1);
-						const oldFile = parts[1];
-						const newFile = parts[2];
-	
-						if (!newFile) return null;
-	
-						return {
-							status: 'R',
-							similarity,
-							oldFile,
-							file: newFile,
-							fullPath: path.join(this.ROOT, newFile)
-						};
-					}
-	
-					// Handle copies
-					if (status?.startsWith('C')) {
-						const similarity = status.substring(1);
-						const oldFile = parts[1];
-						const newFile = parts[2];
-	
-						if (!newFile) return null;
-	
-						return {
-							status: 'C',
-							similarity,
-							oldFile,
-							file: newFile,
-							fullPath: path.join(this.ROOT, newFile)
-						};
-					}
-	
-					const file = parts[1];
-	
-					if (!file || typeof file !== 'string') return null;
-	
-					return {
-						status,
-						file,
-						fullPath: path.join(this.ROOT, file)
-					};
-				})
-				.filter(Boolean);
-	
-			// Get untracked files
-			const untracked = await this.git.raw([
-				'ls-files',
-				'--others',
-				'--exclude-standard'
-			]);
-	
-			const untrackedFiles = untracked
-				.trim()
-				.split('\n')
-				.filter(Boolean)
-				.map(file => ({
-					status: 'A',
-					file,
-					fullPath: path.join(this.ROOT, file)
-				}));
-	
-			const allChanges = [...changes, ...untrackedFiles];
-	
-			if (config.verbose) {
-				const statusCounts = allChanges.reduce((acc, change) => {
-					acc[change.status] = (acc[change.status] || 0) + 1;
-					return acc;
-				}, {});
+		// Force full deployment if requested
+		if (this.options.fullDeployment) {
+			this.log('  Force full deployment requested...', true);
+			files = await this.getAllFiles();
+		} else if (isSecure) {
+			// deploy unstaged/working directory changes
+			this.log('  Since you are using secure mode, deploying unstaged changes only...', true);
+			
+			const options = {
+				includeUnstaged: true,
+				includeUntracked: this.options.includeUntracked !== false,
+				stagedOnly: false,
+				includeCommitted: false
+			};
+			
+			files = await this.getUpdatedFiles(config, options);
+			
+			// If includeDependencies is set, add vendor and node_modules
+			if (this.options.includeDependencies) {
+				this.log('  Including vendor/ and node_modules/ in secure deployment...', true);
 				
-				console.log('📊 Git detected changes:');
-				Object.entries(statusCounts).forEach(([status, count]) => {
-					const statusLabel = {
-						'A': 'Added',
-						'M': 'Modified',
-						'D': 'Deleted',
-						'R': 'Renamed',
-						'C': 'Copied'
-					}[status] || status;
-					console.log(`   ${statusLabel}: ${count} files`);
-				});
+				const dependencyFiles = await this.getDependencyFiles();
+				
+				if (dependencyFiles.length > 0) {
+					files = [...files, ...dependencyFiles];
+					this.log(`  Added ${dependencyFiles.length} dependency files`, true);
+				} else {
+					this.log('  No dependency files found to include', true);
+				}
 			}
-	
-			// Update stats
-			this.options.total = allChanges.length;
-			this.options.included = allChanges.filter(c => c.status !== 'D').length;
-			this.options.excluded = allChanges.filter(c => c.status === 'D').length;
-	
-			return allChanges;
+		} else {
+			// Non-secure mode: deploy based on options
+			const options = {
+				includeUnstaged: this.options.includeUnstaged || false,
+				includeUntracked: this.options.includeUntracked || false,
+				stagedOnly: this.options.stagedOnly || false,
+				includeCommitted: !this.options.includeUnstaged || this.options.stagedOnly
+			};
+			
+			if (config.verbose) {
+				const mode = [];
+				if (options.stagedOnly) mode.push('staged only');
+				if (options.includeUnstaged) mode.push('including unstaged');
+				if (options.includeUntracked) mode.push('including untracked');
+				if (!options.includeCommitted) mode.push('excluding committed');
+				
+				this.log(`  Deploying changes: ${mode.length > 0 ? mode.join(', ') : 'committed only'}...`);
+			}
+			
+			files = await this.getUpdatedFiles(config, options);
+			
+			// If includeDependencies is set, add vendor and node_modules
+			if (this.options.includeDependencies) {
+				this.log('  Including vendor/ and node_modules/ in deployment...', true);
+				
+				const dependencyFiles = await this.getDependencyFiles();
+				
+				if (dependencyFiles.length > 0) {
+					files = [...files, ...dependencyFiles];
+					this.log(`  Added ${dependencyFiles.length} dependency files`, true);
+				} else {
+					this.log('  No dependency files found to include', true);
+				}
+			}
+		}
+
+		// Filter through ignore patterns
+		const { filtered, excluded } = this.filterFiles(files, ig, config);
+
+		let filePaths;
+		if (this.options.fullDeployment) {
+			// getAllFiles returns plain strings, use as-is
+			filePaths = filtered;
+		} else {
+			// getUpdatedFiles returns objects with fullPath
+			filePaths = filtered.map(change => { 
+				if (typeof change === 'string') {
+					return change;
+				}
+				return change.fullPath;
+			});
+		}
+
+		// Calculate and update stats
+		const stats = {
+			total: files.length,
+			included: filtered.length,
+			excluded: excluded.length || (files.length - filtered.length)
+		};
+
+		// Display summary
+		this.displayDeploymentSummary(filtered, stats, isSecure);
+
+		// Validate files exist
+		if (!stats.included) {
+			this.throwNoFilesError(isSecure);
+		}
+
+		return {
+			filePaths,
+			stats,
+			isSecure,
+			filtered
+		};
+	}
+
+	/**
+	 * Get dependency files from vendor and node_modules
+	 * In secure mode, scans filesystem for all dependency files
+	 * In non-secure mode, tries git first, falls back to filesystem
+	 */
+	async getDependencyFiles() {
+		const dependencyPaths = [];
+		const vendorPath = path.join(this.ROOT, 'vendor');
+		const nodeModulesPath = path.join(this.ROOT, 'node_modules');
+		
+		const isSecure = this.options.obfuscateJs || 
+						this.config?.obfuscateJs || 
+						this.options.obfuscatePhp || 
+						this.config?.obfuscatePhp;
+		
+		try { 
+			if (await fs.pathExists(vendorPath)) {
+				if (!isSecure) {
+					// Non-secure: Try git first
+					try {
+						const trackedVendorFiles = await this.git.raw([
+							'ls-files',
+							'--cached',
+							'--others',
+							'--exclude-standard',
+							'vendor/'
+						]);
+						
+						if (trackedVendorFiles.trim()) {
+							const vendorFiles = trackedVendorFiles
+								.trim()
+								.split('\n')
+								.filter(Boolean)
+								.map(file => ({
+									status: 'A',
+									file: file,
+									fullPath: path.join(this.ROOT, file),
+									dependency: true,
+									committed: true,
+									staged: true
+								}));
+							
+							dependencyPaths.push(...vendorFiles);
+							this.log(`  Found ${vendorFiles.length} vendor files (git)`, true);
+						} else {
+							// Fall back to filesystem
+							const vendorFiles = await this.getFilesFromDirectory(vendorPath);
+							dependencyPaths.push(...vendorFiles);
+							this.log(`  Found ${vendorFiles.length} vendor files (filesystem)`, true);
+						}
+					} catch (error) {
+						// fall back to filesystem
+						const vendorFiles = await this.getFilesFromDirectory(vendorPath);
+						dependencyPaths.push(...vendorFiles);
+						this.log(`  Found ${vendorFiles.length} vendor files (filesystem)`, true);
+					}
+				} else {
+					// Always scan filesystem for all dependency files
+					const vendorFiles = await this.getFilesFromDirectory(vendorPath);
+					dependencyPaths.push(...vendorFiles);
+					this.log(`  Found ${vendorFiles.length} vendor files (filesystem)`, true);
+				}
+			} else {
+				this.log('  vendor/ directory not found', true);
+			}
+			
+			if (await fs.pathExists(nodeModulesPath)) {
+				if (!isSecure) {
+					// Non-secure: Try git first
+					try {
+						const trackedNodeFiles = await this.git.raw([
+							'ls-files',
+							'--cached',
+							'--others',
+							'--exclude-standard',
+							'node_modules/'
+						]);
+						
+						if (trackedNodeFiles.trim()) {
+							const nodeFiles = trackedNodeFiles
+								.trim()
+								.split('\n')
+								.filter(Boolean)
+								.map(file => ({
+									status: 'A',
+									file: file,
+									fullPath: path.join(this.ROOT, file),
+									dependency: true,
+									committed: true,
+									staged: true
+								}));
+							
+							dependencyPaths.push(...nodeFiles);
+							this.log(`  Found ${nodeFiles.length} node_modules files (git)`, true);
+						} else {
+							// Fall back to filesystem
+							const nodeFiles = await this.getFilesFromDirectory(nodeModulesPath);
+							dependencyPaths.push(...nodeFiles);
+							this.log(`  Found ${nodeFiles.length} node_modules files (filesystem)`, true);
+						}
+					} catch (error) {
+						// Git failed, fall back to filesystem
+						const nodeFiles = await this.getFilesFromDirectory(nodeModulesPath);
+						dependencyPaths.push(...nodeFiles);
+						this.log(`  Found ${nodeFiles.length} node_modules files (filesystem)`, true);
+					}
+				} else {
+					// Always scan filesystem for all dependency files
+					const nodeFiles = await this.getFilesFromDirectory(nodeModulesPath);
+					dependencyPaths.push(...nodeFiles);
+					this.log(`  Found ${nodeFiles.length} node_modules files (filesystem)`, true);
+				}
+			} else {
+				this.log('  node_modules/ directory not found', true);
+			}
+			
 		} catch (error) {
-			if (error.message.includes('unknown revision')) {
-				throw new Error(
-					`Deploy marker references invalid commit: ${lastDeploy}\n` +
-					'Try deleting .last-deploy file for full deployment'
-				);
+			this.log(`  Warning: Could not get dependency files: ${error.message}`, true, 'warning');
+		}
+		
+		return dependencyPaths;
+	}
+
+	/**
+	 * Get all files from a directory recursively (filesystem scan)
+	 * Used primarily in secure mode to include all dependency files
+	 */
+	async getFilesFromDirectory(dirPath) {
+		const files = [];
+		
+		try {
+			const entries = await fs.readdir(dirPath, { withFileTypes: true });
+			
+			for (const entry of entries) {
+				const fullPath = path.join(dirPath, entry.name);
+				const relativePath = path.relative(this.ROOT, fullPath).replace(/\\/g, '/');
+				
+				// Skip common unnecessary files in dependencies - ensure safety & security is not compromised
+				const skipDirs = ['.git', '.svn', 'test', 'tests', 'docs', 'examples', 'node_modules'];
+				const skipFiles = ['.gitattributes', '.gitignore', '.npmignore', '.eslintrc', 'process.env.js'];
+				const skipExtensions = ['.md', '.markdown', '.txt', '.log'];
+				
+				if (entry.isDirectory()) {
+					// Skip unnecessary directories
+					if (skipDirs.includes(entry.name)) {
+						continue;
+					}
+					
+					const subFiles = await this.getFilesFromDirectory(fullPath);
+					files.push(...subFiles);
+				} else if (entry.isFile()) {
+					// Skip unnecessary files
+					if (skipFiles.some(f => entry.name.startsWith(f))) {
+						continue;
+					}
+					
+					const ext = path.extname(entry.name).toLowerCase();
+					if (skipExtensions.includes(ext) && 
+						entry.name !== 'composer.lock' && 
+						entry.name !== 'package-lock.json') {
+						continue;
+					}
+					
+					files.push({
+						status: 'A',
+						file: relativePath,
+						fullPath: fullPath,
+						dependency: true,
+						committed: false,
+						staged: false
+					});
+				}
 			}
-			throw error;
+		} catch (error) {
+			this.log(`  Cannot read directory ${dirPath}: ${error.message}`, true);
+		}
+		
+		return files;
+	}
+
+	/**
+	 * Display deployment summary
+	 */
+	displayDeploymentSummary(filtered, stats, isSecure) {
+		if (this.options.fullDeployment) {
+			this.log(
+				` Full deployment: ${stats.total} total files, ${stats.included} included, ${stats.excluded} excluded`, true, 'info'
+			);
+		} else if (isSecure) {
+			const unstagedCount = filtered.filter(f => f.staged === false && !f.untracked).length;
+			const untrackedCount = filtered.filter(f => f.untracked === true).length;
+			
+			let message = `Secure deployment: ${stats.included} unstaged files`;
+			
+			const details = [];
+			if (unstagedCount > 0) details.push(`${unstagedCount} modified`);
+			if (untrackedCount > 0) details.push(`${untrackedCount} new/untracked`);
+			
+			if (details.length > 0) {
+				message += ` (${details.join(', ')})`;
+			}
+			
+			message += `, ${stats.excluded} excluded`;
+			this.log(message, true, 'info');
+		} else {
+			const mode = this.options.stagedOnly ? 'staged' : 
+						this.options.includeUnstaged ? 'committed + unstaged' : 'committed';
+			
+			let message = `Incremental deployment (${mode}): ${stats.included} files`;
+			
+			const details = [];
+			const committedCount = filtered.filter(f => f.committed).length;
+			const unstagedCount = filtered.filter(f => f.staged === false && !f.untracked).length;
+			const untrackedCount = filtered.filter(f => f.untracked).length;
+			
+			if (committedCount > 0) details.push(`${committedCount} committed`);
+			if (unstagedCount > 0) details.push(`${unstagedCount} unstaged`);
+			if (untrackedCount > 0) details.push(`${untrackedCount} untracked`);
+			
+			if (details.length > 0) {
+				message += ` (${details.join(', ')})`;
+			}
+			
+			message += `, ${stats.excluded} excluded`;
+			this.log(message, true, 'info');
 		}
 	}
 
-	filterFiles(files, ig, config) {
-		const filtered = files.filter((changedFile) => {
-			let rel = path.relative(this.ROOT, changedFile);
-			if (!this.options.obfuscateJs || !config.obfuscateJs || !this.options.obfuscatePhp || !config.obfuscatePhp) {
-				rel = changedFile.file.replace(/\\/g, '/'); 
-			}
-
-			const isIgnored = ig.ignores(rel);
-
-			if (config.verbose && isIgnored) {
-				console.log(`  ⏭️  Ignored: ${rel}`);
-			}
-
-			return !isIgnored;
-		}); 
-
-		return filtered;
+	/**
+	 * Throw descriptive error when no files to deploy
+	 */
+	throwNoFilesError(isSecure) {
+		if (this.options.fullDeployment) {
+			throw new Error(
+				'No files to deploy.\n' +
+				'  - Check your .updateignore configuration\n' +
+				'  - Verify project structure has files'
+			);
+		} else if (isSecure) {
+			throw new Error(
+				'No unstaged changes to deploy.\n' +
+				'  Options:\n' +
+				'  - Make changes to your files first, then run deploy\n' +
+				'  - Use --full for a complete deployment\n' +
+				'  - Check your .updateignore configuration'
+			);
+		} else if (this.options.stagedOnly) {
+			throw new Error(
+				'No staged changes to deploy.\n' +
+				'  Options:\n' +
+				'  - Stage your changes first (git add)\n' +
+				'  - Use --include-unstaged to include working directory changes\n' +
+				'  - Use --full for a complete deployment\n' +
+				'  - Delete .last-deploy file for a full deployment'
+			);
+		} else {
+			throw new Error(
+				'No committed changes to deploy.\n' +
+				'  Options:\n' +
+				'  - Commit your changes first (git commit)\n' +
+				'  - Use --include-unstaged to include working directory changes\n' +
+				'  - Use --full for a complete deployment\n' +
+				'  - Delete .last-deploy file for a full deployment'
+			);
+		}
 	}
 
 	/** 
@@ -420,7 +1046,7 @@ class App {
 
 			output.on('close', () => {
 				const sizeInMB = (archive.pointer() / (1024 * 1024)).toFixed(2);
-				console.log(`✅  Archive created (${sizeInMB} MB, ${processedFiles} files)`);
+				this.log(`Archive created (${sizeInMB} MB, ${processedFiles} files)`, false, 'archive');
 				resolve();
 			});
 
@@ -431,7 +1057,7 @@ class App {
 				if (progress.entries && progress.entries.processed > processedFiles) {
 					processedFiles = progress.entries.processed;
 					if (config.verbose) {
-						console.log(`  📦 Adding: ${processedFiles}/${totalFiles} files`);
+						this.log(`  Adding: ${processedFiles}/${totalFiles} files`);
 					}
 				}
 			});
@@ -454,9 +1080,7 @@ class App {
 	*/
 	async validateBranch(expectedBranch) {
 		try {
-			const {
-				stdout: branch
-			} = await execa('git', [
+			const { stdout: branch } = await execa('git', [
 				'rev-parse',
 				'--abbrev-ref',
 				'HEAD'
@@ -470,7 +1094,7 @@ class App {
 				);
 			}
 
-			console.log(`✅  Branch verified: ${currentBranch}`);
+			this.log(`Branch verified: ${currentBranch}`, true, 'info');
 			return currentBranch;
 		} catch (error) {
 			if (error.message.includes('Branch mismatch')) {
@@ -485,32 +1109,32 @@ class App {
 
 		for (let attempt = 1; attempt <= config.maxRetries; attempt++) {
 			try {
-				console.log(`📤  Upload attempt ${attempt}/${config.maxRetries}...`);
+				this.log(`Upload attempt ${attempt}/${config.maxRetries}...`, false, 'upload');
 
 				await client.uploadFrom(localPath, remotePath);
 
-				console.log('✅  Upload complete');
+				this.log('Upload complete', false, 'success');
 				return;
 			} catch (error) {
 				lastError = error;
 
 				if (attempt < config.maxRetries) {
-					console.log(`  🚫 Upload attempt ${attempt} failed, retrying in ${config.retryDelay/1000}s...`);
+					this.log(`  Upload attempt ${attempt} failed, retrying in ${config.retryDelay/1000}s...`);
 					await new Promise(resolve => setTimeout(resolve, config.retryDelay));
 				}
 			}
 		}
 
-		throw new Error(`❌ Upload failed after ${config.maxRetries} attempts: ${lastError.message}`);
+		throw new Error(`Upload failed after ${config.maxRetries} attempts: ${lastError.message}`);
 	}
 
 	async triggerDeploymentStaging(deployUrl, config) {
 		if (!deployUrl) {
-			console.log('🚫  No deployUrl configured, skipping remote deployment staging');
+			this.log('No deployUrl configured, skipping remote deployment staging', false, 'info');
 			return;
 		}
 
-		console.log('🛠️  Triggering remote deployment staging...');
+		this.log('Triggering remote deployment staging...', false, 'info');
 
 		try {
 			const controller = new AbortController();
@@ -549,9 +1173,9 @@ class App {
 			const responseData = await res.json();
 
 			if (responseData.success) {
-				console.log('✅  Remote deployment staging triggered successfully');
-				console.log(`    Files deployed: ${this.options.included || 'N/A'}`);
-				console.log(`    Version: ${config?.version || 'N/A'}`);
+				this.log('Remote deployment staging triggered successfully', false, 'info');
+				this.log(`Files deployed: ${this.options.included || 'N/A'}`, false, 'info');
+				this.log(`Version: ${config?.version || 'N/A'}`, false, 'info');
 			} else {
 				throw new Error(responseData.message || 'Unknown deployment error');
 			}
@@ -567,7 +1191,32 @@ class App {
 	async cleanup(zipPath, config) {
 		if (config.cleanupLocal && await fs.pathExists(zipPath)) {
 			await fs.remove(zipPath);
-			console.log('🧹 Cleanup complete');
+			this.log('Cleanup complete', false, 'info');
+		}
+	}
+
+	/**
+	 * Cleanup after deployment (revert obfuscation and clean files)
+	 */
+	async cleanupAfterDeployment(success = true) {
+		try {
+			// Revert JavaScript obfuscation
+			if (this.options.obfuscateJs || this.config?.obfuscateJs) {
+				await this.revert_js_obfuscation();
+			}
+
+			// Revert PHP obfuscation
+			if (this.options.obfuscatePhp || this.config?.obfuscatePhp) {
+				await this.revert_php_obfuscation();
+			}
+			
+			// Clean up deployment zip
+			if (success) {
+				const zip_path = path.join(this.ROOT, 'deploy.zip');
+				await this.cleanup(zip_path, this.config);
+			}
+		} catch (cleanupError) {
+			this.log(`Cleanup error: ${cleanupError.message}`, true, 'error');
 		}
 	}
 
@@ -591,16 +1240,11 @@ class App {
 				if (file.endsWith('.js') || file.endsWith('.mjs') || file.endsWith('.cjs')) {
 					if (!excluded.includes(file)) {
 						excluded.push(file);
-						
-						if (this.config?.verbose) {
-							console.log(`   ⏭️  Excluding JS from obfuscation: ${file}`);
-						}
+						this.log(`Excluding JS from obfuscation: ${file}`, true);
 					}
 				} else {
 					// For non-JS files, they'll be handled by the PHP obfuscation's ignore list
-					if (this.config?.verbose) {
-						console.log(`   ℹ️  Non-JS file in exclusiveFiles: ${file} (handled elsewhere)`);
-					}
+					this.log(`Non-JS file in exclusiveFiles: ${file} (handled elsewhere)`, true);
 				}
 			});
 		}
@@ -656,13 +1300,13 @@ class App {
 	}
 
 	async obfuscateJavaScript(srcPath, destPath, config) {
-		console.log('\n🔒 Starting JavaScript obfuscation...');
-		console.log(`   Source: ${srcPath}`);
-		console.log(`   Destination: ${destPath}`);
+		this.log('\nStarting JavaScript obfuscation...', false, 'info');
+		this.log(`Source: ${srcPath}`);
+		this.log(`Destination: ${destPath}`);
 
 		if (config.domainLock && config.domainLock.length > 0) {
-			console.log(`   Domain Lock: ${config.domainLock.join(', ')}`);
-			console.log(`   Redirect URL: ${config.domainLockRedirectUrl}`);
+			this.log(`Domain Lock: ${config.domainLock.join(', ')}`, false, 'lock');
+			this.log(`Redirect URL: ${config.domainLockRedirectUrl}`, false, 'info');
 		}
 
 		// Create destination directory if it doesn't exist
@@ -673,7 +1317,7 @@ class App {
 			const preserveDir = config.preserveOriginal;
 			if (fs.existsSync(srcPath)) {
 				await this.copy_folder_recursive(srcPath, preserveDir);
-				console.log(`   Original files preserved in: ${preserveDir}`);
+				this.log(`Original files preserved in: ${preserveDir}`, false, 'backup');
 			}
 		}
 
@@ -691,7 +1335,7 @@ class App {
 				.on('end', async () => {
 					// Copy excluded files as-is
 					await this.copy_excluded_js_files(srcPath, destPath, exclude_files);
-					console.log('✅ JavaScript obfuscation completed');
+					this.log('JavaScript obfuscation completed', false, 'info');
 					resolve();
 				})
 				.on('error', reject);
@@ -705,15 +1349,13 @@ class App {
 
 			if (fs.existsSync(srcFile)) {
 				await fs.copyFile(srcFile, destFile);
-				if (this.options.verbose) {
-					console.log(`   Copied (excluded): ${fileName}`);
-				}
+				this.log(`Copied (excluded): ${fileName}`, true);
 			}
 		}
 	}
 
 	async obfuscatePhp() {
-		console.log('\n🔒 Starting PHP obfuscation...');
+		this.log('\nStarting PHP obfuscation...', false, 'info');
 
 		// Check yakpro-po
 		let yakproPath;
@@ -722,21 +1364,19 @@ class App {
 				encoding: 'utf-8',
 				stdio: 'pipe'
 			}).trim();
-			console.log(`   ✅ Using: ${yakproPath}`);
+			this.log(`Using: ${yakproPath}`);
 		} catch (error) {
-			throw new Error('❌ yakpro-po is not installed.');
+			throw new Error('yakpro-po is not installed.');
 		}
 
 		// Get ignore filter
-		const ig = this.loadIgnore();
+		const includeDeps = this.options.includeDependencies || false;
+		const ig = this.loadIgnore(includeDeps);
 
 		if (this.config?.exclusiveFiles?.length) {
 			this.config.exclusiveFiles.forEach(file => {
 				ig.add(file);
-				
-				if (this.config?.verbose) {
-					console.log(`   ⏭️  Excluding from obfuscation: ${file}`);
-				}
+				this.log(`Excluding from obfuscation: ${file}`, true);
 			});
 		}
 
@@ -745,14 +1385,14 @@ class App {
 
 		try {
 			phpFiles = await this.scan_php_files_with_ignore(ig);
-			console.log(`   Found ${phpFiles.length} PHP files to obfuscate`);
+			this.log(`Found ${phpFiles.length} PHP files to obfuscate`, true, 'info');
 		} catch (error) {
-			console.error(`   ❌ File scan failed: ${error.message}`);
+			this.log(`File scan failed: ${error.message}`, true, 'error');
 			return;
 		}
 
 		if (phpFiles.length === 0) {
-			console.log('   ⚠️  No PHP files found to obfuscate');
+			this.log('No PHP files found to obfuscate', false, 'info');
 			return;
 		}
 
@@ -783,7 +1423,7 @@ class App {
 						file;
 
 					process.stdout.write(
-						`\r   ⏳ [${processed + 1}/${total}] ${percent}% - ${displayFile.padEnd(40)}`
+						`\r   [${processed + 1}/${total}] ${percent}% - ${displayFile.padEnd(40)}`
 					);
 
 					execSync(`"${yakproPath}" "${sourcePath}" -o "${outputFile}"`, {
@@ -810,28 +1450,28 @@ class App {
 		process.stdout.write('\r' + ' '.repeat(80) + '\r');
 
 		// Show obfuscation summary
-		console.log('');
-		console.log(`✅ PHP obfuscation completed in ${duration}s`);
-		console.log(`   ✅ Successfully processed: ${processed}/${total} files`);
+		this.log(' ', false, 'space');
+		this.log(`PHP obfuscation completed in ${duration}s`, true, 'info');
+		this.log(`Successfully processed: ${processed}/${total} files`, true, 'success');
 
 		if (failed > 0) {
-			console.log(`   ❌ Failed: ${failed} files`);
+			this.log(`Failed: ${failed} files`, true, 'error');
 		}
 
 		// REPLACE ORIGINAL FILES WITH OBFUSCATED ONES
 		if (processed > 0) {
-			console.log('\n🔄 Replacing original PHP files with obfuscated versions...');
+			this.log('\nReplacing original PHP files with obfuscated versions...', false, 'info');
 
 			try {
 				await this.replace_php_files(phpFiles, failedFiles);
-				console.log('✅ PHP files replaced successfully');
+				this.log('PHP files replaced successfully', false, 'info');
 			} catch (error) {
-				console.error(`   ⚠️  Failed to replace files: ${error.message}`);
-				console.log('   Obfuscated files are available in the "obfuscated/" directory');
+				this.log(`Failed to replace files: ${error.message}`, true, 'error');
+				this.log('   Obfuscated files are available in the "obfuscated/" directory', true, 'info');
 			}
 		}
 
-		console.log('');
+		this.log(' ', false, 'space');
 	}
 
 	/**
@@ -842,7 +1482,7 @@ class App {
 		const failedFileNames = new Set(failedFiles.map(f => f.file));
 		const backupDir = path.join(this.ROOT, 'original_php_backup');
 
-		console.log(`   Creating backup in: ${path.relative(this.ROOT, backupDir)}`);
+		this.log(`Creating backup in: ${path.relative(this.ROOT, backupDir)}`, false, 'backup');
 
 		let replaced = 0;
 		let backedUp = 0;
@@ -860,9 +1500,7 @@ class App {
 			try {
 				// Check if obfuscated file exists
 				if (!fs.existsSync(obfuscatedPath)) {
-					if (this.options.verbose) {
-						console.log(`   ⚠️  Obfuscated file not found: ${file}`);
-					}
+					this.log(`Obfuscated file not found: ${file}`, true);
 					continue;
 				}
 
@@ -878,28 +1516,24 @@ class App {
 				replaced++;
 
 				if (this.options.verbose && replaced % 50 === 0) {
-					console.log(`   Replaced: ${replaced} files`);
+					this.log(`Replaced: ${replaced} files`, true, 'progress');
 				}
 
 			} catch (error) {
-				if (this.options.verbose) {
-					console.error(`   ⚠️  Failed to replace ${file}: ${error.message}`);
-				}
+				this.log(`Failed to replace ${file}: ${error.message}`, true);
 			}
 		}
 
-		console.log(`   ✅ Backed up: ${backedUp} original files`);
-		console.log(`   ✅ Replaced: ${replaced} files with obfuscated versions`);
+		this.log(`Backed up: ${backedUp} original files`);
+		this.log(`Replaced: ${replaced} files with obfuscated versions`);
 
 		// Clean up obfuscated directory after successful replacement
 		if (replaced > 0) {
 			try {
 				await fs.remove(path.join(this.ROOT, 'obfuscated'));
-				console.log('   🧹 Cleaned up obfuscated/ directory');
+				this.log('   Cleaned up obfuscated/ directory', false, 'info');
 			} catch (error) {
-				if (this.options.verbose) {
-					console.log(`   ⚠️  Could not clean up obfuscated/ directory`);
-				}
+				this.log('   Could not clean up obfuscated/ directory', true);
 			}
 		}
 	}
@@ -925,9 +1559,7 @@ class App {
 
 					// Check if path is ignored
 					if (ig.ignores(normalizedPath)) {
-						if (this.options.verbose) {
-							console.log(`   ⏭️  Ignored: ${normalizedPath}`);
-						}
+						this.log(`Ignored: ${normalizedPath}`, true);
 						continue;
 					}
 
@@ -938,9 +1570,7 @@ class App {
 					}
 				}
 			} catch (error) {
-				if (this.options.verbose) {
-					console.error(`   ⚠️  Cannot access directory: ${dir} (${error.message})`);
-				}
+				this.log(`Cannot access directory: ${dir} (${error.message})`, true);
 			}
 		};
 
@@ -955,29 +1585,27 @@ class App {
 		const backupDir = path.join(this.ROOT, 'original_php_backup');
 
 		if (!fs.existsSync(backupDir)) {
-			console.log('⚠️  No PHP backup found. Nothing to revert.');
+			this.log('No PHP backup found. Nothing to revert.', true);
 			return;
 		}
 
-		console.log('\n🔄 Reverting PHP files to original versions...');
+		this.log('\nReverting PHP files to original versions...', false, 'info');
 
 		// Count backup files
 		const backupFiles = await this.count_files_recursive(backupDir);
-		console.log(`   Found ${backupFiles} backed up PHP files`);
+		this.log(`Found ${backupFiles} backed up PHP files`);
 
 		// Copy backup files back to original locations
 		await this.copy_folder_recursive(backupDir, this.ROOT);
 
-		console.log(`✅ Reverted ${backupFiles} PHP files`);
+		this.log(`Reverted ${backupFiles} PHP files`);
 
 		// Clean up backup
 		try {
 			await fs.remove(backupDir);
-			console.log('🧹 Cleaned up backup directory');
+			this.log('Cleaned up backup directory', false, 'info');
 		} catch (error) {
-			if (this.options.verbose) {
-				console.log(`   ⚠️  Could not clean up backup directory: ${error.message}`);
-			}
+			this.log(`Could not clean up backup directory: ${error.message}`, true);
 		}
 	}
 
@@ -992,15 +1620,15 @@ class App {
 
 		// Check if obfuscated version exists
 		if (!fs.existsSync(jsDest)) {
-			console.log('⚠️  No obfuscated JavaScript found. Nothing to revert.');
+			this.log('No obfuscated JavaScript found. Nothing to revert.', true);
 			return;
 		}
 
-		console.log('\n🔄 Reverting JavaScript files to original versions...');
+		this.log('\nReverting JavaScript files to original versions...', false, 'info');
 
 		// If we have a backup, restore from it
 		if (fs.existsSync(preserveDir)) {
-			console.log(`   Restoring from backup: ${preserveDir}`);
+			this.log(`Restoring from backup: ${preserveDir}`);
 
 			// Remove current obfuscated files
 			if (fs.existsSync(jsSrc)) {
@@ -1013,16 +1641,16 @@ class App {
 
 			// Clean up backup
 			await fs.remove(preserveDir);
-			console.log('   🧹 Cleaned up backup directory');
+			this.log('   Cleaned up backup directory', false, 'info');
 		} else {
 			// No backup, try swapping directories back
 			if (fs.existsSync(jsDest)) {
-				console.log('   Swapping directories back...');
+				this.log('   Swapping directories back...', false, 'info');
 				await this.rename_directories(jsDest, jsSrc);
 			}
 		}
 
-		console.log('✅ JavaScript files reverted successfully');
+		this.log('JavaScript files reverted successfully', false, 'info');
 	}
 
 	/**
@@ -1053,7 +1681,7 @@ class App {
 
 	async rename_directories(srcPath, destPath) {
 		if (!fs.existsSync(srcPath) || !fs.existsSync(destPath)) {
-			console.warn('⚠️  Cannot swap directories: one or both paths do not exist');
+			this.log('Cannot swap directories: one or both paths do not exist', 'true', 'warn');
 			return;
 		}
 
@@ -1075,9 +1703,9 @@ class App {
 				overwrite: true
 			});
 
-			console.log('🔄 Directories swapped successfully');
+			this.log('Directories swapped successfully', false, 'info');
 		} catch (error) {
-			console.error(`⚠️  Directory swap failed: ${error.message}`);
+			this.log(`Directory swap failed: ${error.message}`, true, 'error');
 
 			// Attempt recovery
 			try {
@@ -1087,7 +1715,7 @@ class App {
 					});
 				}
 			} catch (recoveryError) {
-				console.error(`⚠️  Recovery failed: ${recoveryError.message}`);
+				this.log(`Recovery failed: ${recoveryError.message}`, true, 'error');
 			}
 
 			throw error;
@@ -1095,7 +1723,7 @@ class App {
 	}
 	
 	async generateControllers(controllers = []) {
-		console.log('\n📝 Generating controllers...');
+		this.log('\nGenerating controllers...', false, 'info');
 
 		const controllers_dir = path.join(this.ROOT, 'app', 'http', 'controllers');
 		await fs.ensureDir(controllers_dir);
@@ -1109,9 +1737,7 @@ class App {
 			const controller_file_path = path.join(controllers_dir, controller_file_name);
 
 			if (await fs.pathExists(controller_file_path)) {
-				if (this.options.verbose) {
-					console.log(`   ⏭️  Controller '${controller_name}' already exists`);
-				}
+				this.log(`Controller '${controller_name}' already exists`, true);
 				existing++;
 				continue;
 			}
@@ -1120,11 +1746,11 @@ class App {
 			let templateContent = await this.templatesReader('partials/controllers/template.php');
 			
 			await fs.writeFile(controller_file_path, templateContent);
-			console.log(`   ✅ Controller '${controller_name}' generated`);
+			this.log(`Controller '${controller_name}' generated`);
 			generated++;
 		}
 
-		console.log(`\n   Summary: ${generated} created, ${existing} already existed`);
+		this.log(`\n   Summary: ${generated} created, ${existing} already existed`);
 		return {
 			generated,
 			existing
@@ -1154,6 +1780,7 @@ class App {
 			}
 		}
 	}
+
 	
 	/**
 	 * Main deployment pipeline
@@ -1163,7 +1790,7 @@ class App {
 		const config = await this.loadConfig();
 
 		try {
-			console.log('\n🚀 Starting XFIX deployment...\n');
+			this.log('Starting XFIX deployment...', false, 'deploy');
 
 			// Validate configuration
 			this.validateConfig(config);
@@ -1187,8 +1814,8 @@ class App {
 				const js_dest = this.options.jsDestPath || config.jsDestPath || 'public/orig';
 
 				if (!fs.existsSync(js_src)) {
-					console.warn(`⚠️  JavaScript source directory not found: ${js_src}`);
-					console.warn('   Skipping JS obfuscation');
+					this.log(`JavaScript source directory not found: ${js_src}`, true, 'warn');
+					this.log('   Skipping JS obfuscation', true, 'warn');
 				} else {
 					await this.obfuscateJavaScript(js_src, js_dest, config);
 					await this.rename_directories(js_src, js_dest);
@@ -1215,49 +1842,21 @@ class App {
 			await this.validateBranch(config?.branch || 'main');
 
 			// Scan and filter files
-			console.log('\n📦 Scanning project files...');
-			const ig = this.loadIgnore(); 
+			this.log('Scanning project files...', false, 'scan');
+			const includeDeps = this.options.includeDependencies || false;
+			const ig = this.loadIgnore(includeDeps); 
 			
-			let files = await this.getUpdatedFiles(config); 
-			if (secure) {
-				// since secured files should not be commited
-				if (this.config?.verbose) {
-					console.log(`  ⏭️  Since you are using secure mode, full application scope compilation is going to be targeted...`);
-				}
+			const { filePaths, stats, isSecure } = await this.getDeploymentFiles(config, ig);
 
-				files = await this.getAllFiles(); 
-			}
-
-			let filePaths = this.filterFiles(files, ig, config);
-
-			// Extract file paths from change objects 
-			if (!secure) {
-				filePaths = filePaths.map(change => change.fullPath);
-			}
-
-			const total = files.length;
-			const included = filePaths.length;
-			const excluded = total - included;
-
-			this.options.total = total;
-			this.options.included = included;
-			this.options.excluded = excluded;
-
-			console.log(
-				`   Found ${total} changed files: ${included} included, ${excluded} excluded`
-			);
-
-			if (!included) {
-				throw new Error('No files to deploy. Check your .updateignore configuration.');
-			}
+			if (!stats.included) return;
 
 			// Create archive
 			const zip_path = path.join(this.ROOT, 'deploy.zip');
-			console.log('\n📦 Creating archive...');
+			this.log('Creating archive...', false, 'archive');
 			await this.createArchive(zip_path, filePaths, config);
 
 			// Upload to server
-			console.log('\n🔗  Connecting to server...');
+			this.log('Connecting to server...', false, 'connect');
 			const client = new ftp.Client();
 			client.ftp.verbose = config.verbose;
 			
@@ -1272,11 +1871,11 @@ class App {
 					} : undefined
 				});
 
-				console.log('✅  Connected to server');
+				this.log('Connected to server', false, 'success');
 
 				if (config.verbose) {
 					client.trackProgress(info => {
-						console.log(`  Uploaded: ${(info.bytes / 1024).toFixed(1)}KB`);
+						this.log(`  Uploaded: ${(info.bytes / 1024).toFixed(1)}KB`, true, 'upload');
 					});
 				}
 
@@ -1285,47 +1884,30 @@ class App {
 
 			} finally {
 				client.close();
-				console.log('✅  FTP connection closed');
+				this.log('	FTP connection closed', false, 'info');
 			}
 
 			// Trigger remote deployment staging
-			console.log('');
+			this.log(' ', false, 'space');
 			await this.triggerDeploymentStaging(config.deployUrl, config);
 
-			if (!secure) {
-				await this.updateDeployMarker(); 
+			// Update deploy marker only for non-secure incremental deployments
+			if (!isSecure) {
+				await this.updateDeployMarker();
 			}
-
-			// Cleanup
-			await this.cleanup(zip_path, config);
 
 			const duration = ((Date.now() - start_time) / 1000).toFixed(2);
-			
-			console.log(`\n✅ Deployment staged successfully in ${duration}s\n`);
+			this.log(`\nDeployment staged successfully in ${duration}s\n`, true, 'success');
 
-			// Revert back to originals if --secure || obfuscation flags 
-			// was applied
-			if (this.options.obfuscateJs || config.obfuscateJs) {
-				await this.revert_js_obfuscation();
-			}
+			// Cleanup after successful deployment
+			await this.cleanupAfterDeployment(true);
 
-			if (this.options.obfuscatePhp || config.obfuscatePhp) { 
-				await this.revert_php_obfuscation();
-			}
-
-		} catch (error) { 
+		} catch (error) {
 			const zip_path = path.join(this.ROOT, 'deploy.zip');
 			await this.cleanup(zip_path, config);
 
-			// Revert back to originals if --secure || obfuscation flags 
-			// was applied
-			if (this.options.obfuscateJs || config.obfuscateJs) {
-				await this.revert_js_obfuscation();
-			}
-
-			if (this.options.obfuscatePhp || config.obfuscatePhp) { 
-				await this.revert_php_obfuscation();
-			}
+			// Revert obfuscation on error
+			await this.cleanupAfterDeployment(false);
 
 			throw error;
 		}
@@ -1339,7 +1921,7 @@ class App {
 		const config = await this.loadConfig();
 
 		try {
-			console.log('🔒 Starting obfuscation process...\n');
+			this.log('Starting obfuscation process...\n', false, 'info');
 
 			// JavaScript obfuscation
 			if (this.options.obfuscateJs || config.obfuscateJs) {
@@ -1347,7 +1929,7 @@ class App {
 				const js_dest = this.options.jsDestPath || config.jsDestPath || 'public/orig';
 
 				if (!fs.existsSync(js_src)) {
-					console.error(`JavaScript source directory not found: ${js_src}`);
+					this.log(`JavaScript source directory not found: ${js_src}`, true, 'error');
 					throw new Error(`JavaScript source directory not found: ${js_src}`);
 				}
 
@@ -1363,10 +1945,10 @@ class App {
 			}
 
 			const duration = ((Date.now() - start_time) / 1000).toFixed(2);
-			console.log(`\n✅ Obfuscation completed in ${duration}s\n`);
+			this.log(`\nObfuscation completed in ${duration}s\n`, true, 'success');
 
 		} catch (error) {
-			console.error(`\n❌ Obfuscation failed: ${error.message}\n`);
+			this.log(`\nObfuscation failed: ${error.message}\n`, true, 'error');
 			throw error;
 		}
 	}
@@ -1399,13 +1981,11 @@ class App {
 			this.db = await mysql.createConnection(this.dbConfig);
 			await this.createMigrationsTable();
 			
-			if (this.options.verbose) {
-				console.log('✅ Database connected successfully');
-			}
+			this.log('Database connected successfully', true);
 			
 			return this.db;
 		} catch (error) {
-			throw new Error(`❌ Database connection failed: ${error.message}`);
+			throw new Error(`Database connection failed: ${error.message}`);
 		}
 	}
 
@@ -1459,9 +2039,9 @@ class App {
 		await fs.writeFile(filepath, templateContent);
 		
 		if (verbose) {
-			console.log(`📝 Created ${lang.toUpperCase()} migration: ${filename}`);
+			this.log(`Created ${lang.toUpperCase()} migration: ${filename}`);
 		} else {
-			console.log(`   ✅ Created: ${filename} (${lang.toUpperCase()})`);
+			this.log(`Created: ${filename} (${lang.toUpperCase()})`);
 		}
 		
 		// Auto-generate MigrationRunner for PHP projects
@@ -1482,8 +2062,6 @@ class App {
 		let templatePath;
 		
 		// Select template based on type and language
-		// Template files should follow pattern: migrations/{type}.{lang}
-		// e.g., migrations/create.js, migrations/create.php
 		switch(type) {
 			case 'create':
 				templatePath = `migrations/create.${lang}`;
@@ -1518,7 +2096,6 @@ class App {
 
 	/**
 	 * Generate class name from migration name
-	 * e.g., "create_users_table" → "CreateUsersTable"
 	 */
 	generateClassName(name) {
 		// Remove timestamp prefix if present
@@ -1533,9 +2110,6 @@ class App {
 
 	/**
 	 * Template reader utility
-	 * @param {string} templatePath - Path to template file relative to partials directory
-	 * @param {Object} variables - Key-value pairs to replace in the template
-	 * @returns {Promise<string>} - Processed template content
 	 */
 	async templatesReader(templatePath, variables = {}) { 
 		const __filename = fileURLToPath(import.meta.url);
@@ -1558,11 +2132,11 @@ class App {
 		// Remove backticks from template content
 		templateContent = templateContent.replace(/`/g, ''); 
 
-        // Remove semicolons after closing braces
-        templateContent = templateContent.replace(/}(\s*);/g, '}$1');
-        
-        // Remove extra semicolons that became orphaned
-        templateContent = templateContent.replace(/^\s*;\s*$/gm, '');
+		// Remove semicolons after closing braces
+		templateContent = templateContent.replace(/}(\s*);/g, '}$1');
+		
+		// Remove extra semicolons that became orphaned
+		templateContent = templateContent.replace(/^\s*;\s*$/gm, '');
 
 		return templateContent;
 	}
@@ -1580,7 +2154,7 @@ class App {
 			const migrationsDir = path.join(this.ROOT, 'public/storage/database', 'migrations');
 			
 			if (!await fs.pathExists(migrationsDir)) {
-				console.log('📁 No migrations directory found. Creating...');
+				this.log('No migrations directory found. Creating...', false, 'info');
 				await fs.ensureDir(migrationsDir);
 				return;
 			}
@@ -1590,7 +2164,7 @@ class App {
 			migrationFiles = migrationFiles.filter(file => file.endsWith('.mjs')).sort();
 			
 			if (migrationFiles.length === 0) {
-				console.log('📁 No migration files found');
+				this.log('No migration files found', false, 'info');
 				return;
 			}
 			
@@ -1608,13 +2182,13 @@ class App {
 			}
 			
 			if (pending.length === 0) {
-				console.log('✅ No pending migrations');
+				this.log('No pending migrations', false, 'info');
 				return;
 			}
 			
 			if (dryRun) {
-				console.log('\n📋 Pending migrations:');
-				pending.forEach(file => console.log(`   • ${file}`));
+				this.log('\nPending migrations:', false, 'info');
+				pending.forEach(file => this.log(`- ${file}`));
 				return;
 			}
 			
@@ -1624,7 +2198,7 @@ class App {
 			);
 			const currentBatch = (lastBatch[0].max_batch || 0) + 1;
 			
-			console.log(`\n🔄 Running ${pending.length} migration(s) in batch ${currentBatch}...\n`);
+			this.log(`\nRunning ${pending.length} migration(s) in batch ${currentBatch}...\n`, true, 'infor');
 			
 			// Run migrations
 			let successCount = 0;
@@ -1632,7 +2206,7 @@ class App {
 			
 			for (const file of pending) {
 				if (verbose) {
-					console.log(`   📝 Running: ${file}`);
+					this.log(`Running: ${file}`, true, 'info');
 				}
 				
 				try {
@@ -1653,18 +2227,18 @@ class App {
 					
 					successCount++;
 					if (verbose) {
-						console.log(`   ✅ Completed: ${file}`);
+						this.log(`Completed: ${file}`);
 					} else {
-						console.log(`   ✅ ${file}`);
+						this.log(`${file}`);
 					}
 					
 				} catch (err) {
 					errorCount++;
-					console.error(`   ❌ Failed: ${file}`);
-					console.error(`      Error: ${err.message}`);
+					this.log(`Failed: ${file}`, true, 'error');
+					this.log(`Error: ${err.message}`, false, 'error');
 					
 					if (verbose) {
-						console.error(err.stack);
+						this.log(err.stack, true, 'error');
 					}
 					
 					// Stop execution on error
@@ -1672,10 +2246,9 @@ class App {
 				}
 			}
 			
-			console.log(`\n✅ Migrations completed: ${successCount} succeeded, ${errorCount} failed`);
+			this.log(`\nMigrations completed: ${successCount} succeeded, ${errorCount} failed`, true, 'info');
 			
 		} finally {
-			// Always close the database connection
 			await this.closeDatabase();
 		}
 	}
@@ -1692,14 +2265,12 @@ class App {
 			let migrationsToRollback;
 			
 			if (target) {
-				// Rollback to specific migration (including that migration)
 				const [rows] = await this.db.execute(
 					'SELECT migration FROM migrations WHERE migration >= ? ORDER BY batch DESC, id DESC',
 					[target]
 				);
 				migrationsToRollback = rows;
 			} else {
-				// Rollback last batch(es)
 				let batches;
 				
 				if (step === 1) {
@@ -1716,7 +2287,7 @@ class App {
 				}
 				
 				if (batches.length === 0 || !batches[0].batch) {
-					console.log('✅ No migrations to rollback');
+					this.log('No migrations to rollback', false, 'info');
 					return;
 				}
 				
@@ -1731,17 +2302,17 @@ class App {
 			}
 			
 			if (migrationsToRollback.length === 0) {
-				console.log('✅ No migrations to rollback');
+				this.log('No migrations to rollback', false, 'info');
 				return;
 			}
 			
 			if (dryRun) {
-				console.log('\n📋 Migrations to rollback:');
-				migrationsToRollback.forEach(m => console.log(`   • ${m.migration}`));
+				this.log('\nMigrations to rollback:', false, 'info');
+				migrationsToRollback.forEach(m => this.log(`- ${m.migration}`));
 				return;
 			}
 			
-			console.log(`\n⏪ Rolling back ${migrationsToRollback.length} migration(s)...\n`);
+			this.log(`\nRolling back ${migrationsToRollback.length} migration(s)...\n`);
 			
 			const migrationsDir = path.join(this.ROOT, 'public/storage/database', 'migrations');
 			let successCount = 0;
@@ -1751,16 +2322,15 @@ class App {
 				const file = migration.migration;
 				
 				if (verbose) {
-					console.log(`   📝 Rolling back: ${file}`);
+					this.log(`Rolling back: ${file}`);
 				} else {
-					console.log(`   ⏪ ${file}`);
+					this.log(`${file}`);
 				}
 				
 				try {
 					const migrationPath = path.join(migrationsDir, file);
 					if (!await fs.pathExists(migrationPath)) {
-						console.warn(`   ⚠️  Migration file not found: ${file}`);
-						// Remove from migrations table
+						this.log(`Migration file not found: ${file}`, true, 'warn');
 						await this.db.execute(
 							'DELETE FROM migrations WHERE migration = ?',
 							[file]
@@ -1777,7 +2347,6 @@ class App {
 					
 					await migrationModule.down(this.db);
 					
-					// Remove from migrations table
 					await this.db.execute(
 						'DELETE FROM migrations WHERE migration = ?',
 						[file]
@@ -1785,21 +2354,20 @@ class App {
 					
 					successCount++;
 					if (verbose) {
-						console.log(`   ✅ Rolled back: ${file}`);
+						this.log(`Rolled back: ${file}`);
 					}
 					
 				} catch (err) {
 					errorCount++;
-					console.error(`   ❌ Failed to rollback: ${file}`);
-					console.error(`      Error: ${err.message}`);
+					this.log(`Failed to rollback: ${file}`, true, 'error');
+					this.log(`Error: ${err.message}`, false, 'error');
 					throw new Error(`Rollback failed: ${file} - ${err.message}`);
 				}
 			}
 			
-			console.log(`\n✅ Rollback completed: ${successCount} succeeded, ${errorCount} failed`);
+			this.log(`\nRollback completed: ${successCount} succeeded, ${errorCount} failed`);
 			
 		} finally {
-			// Always close the database connection
 			await this.closeDatabase();
 		}
 	}
@@ -1814,20 +2382,18 @@ class App {
 			const migrationsDir = path.join(this.ROOT, 'public/storage/database', 'migrations');
 			
 			if (!await fs.pathExists(migrationsDir)) {
-				console.log('📁 No migrations directory found');
+				this.log('No migrations directory found', false, 'info');
 				return;
 			}
 			
-			// Get all migration files
 			let migrationFiles = await fs.readdir(migrationsDir);
 			migrationFiles = migrationFiles.filter(file => file.endsWith('.mjs')).sort();
 			
 			if (migrationFiles.length === 0) {
-				console.log('📁 No migration files found');
+				this.log('No migration files found', false, 'info');
 				return;
 			}
 			
-			// Get executed migrations
 			const [executed] = await this.db.execute(
 				'SELECT migration, batch, executed_at FROM migrations ORDER BY batch, id'
 			);
@@ -1840,66 +2406,62 @@ class App {
 				});
 			});
 			
-			// Display table
-			console.log('\n┌' + '─'.repeat(50) + '┬' + '─'.repeat(10) + '┬' + '─'.repeat(25) + '┐');
-			console.log('│ ' + 'Migration'.padEnd(48) + ' │ ' + 'Status'.padEnd(8) + ' │ ' + 'Batch/Date'.padEnd(23) + ' │');
-			console.log('├' + '─'.repeat(50) + '┼' + '─'.repeat(10) + '┼' + '─'.repeat(25) + '┤');
+			this.log('\n' + '-'.repeat(50) + '-' + '-'.repeat(10) + '-' + '-'.repeat(25));
+			this.log(' ' + 'Migration'.padEnd(48) + '  ' + 'Status'.padEnd(8) + '  ' + 'Batch/Date'.padEnd(23));
+			this.log('-'.repeat(50) + '-' + '-'.repeat(10) + '-' + '-'.repeat(25));
 			
 			for (const file of migrationFiles) {
 				const status = executedMap.get(file);
-				const statusText = status ? '✓ APPLIED' : '○ PENDING';
+				const statusText = status ? 'APPLIED' : 'PENDING';
 				const info = status 
 					? `Batch ${status.batch}`
 					: 'Not executed';
 				
 				const fileName = file.length > 46 ? file.substring(0, 43) + '...' : file;
-				console.log(`│ ${fileName.padEnd(48)} │ ${statusText.padEnd(8)} │ ${info.padEnd(23)} │`);
+				this.log(` ${fileName.padEnd(48)}  ${statusText.padEnd(8)}  ${info.padEnd(23)}`);
 			}
 			
-			console.log('└' + '─'.repeat(50) + '┴' + '─'.repeat(10) + '┴' + '─'.repeat(25) + '┘');
+			this.log('-'.repeat(50) + '-' + '-'.repeat(10) + '-' + '-'.repeat(25));
 			
 			if (verbose && executed.length > 0) {
-				console.log('\n📋 Execution Details:');
+				this.log('\nExecution Details:', false, 'info');
 				for (const row of executed) {
 					const date = new Date(row.executed_at).toLocaleString();
-					console.log(`   • ${row.migration} - Batch ${row.batch} (${date})`);
+					this.log(`- ${row.migration} - Batch ${row.batch} (${date})`);
 				}
 			}
 			
-			console.log(`\n📊 Summary: ${executed.length} executed, ${migrationFiles.length - executed.length} pending`);
+			this.log(`\nSummary: ${executed.length} executed, ${migrationFiles.length - executed.length} pending`);
 			
 		} finally {
-			// Always close the database connection
 			await this.closeDatabase();
 		}
 	}
 
 	/**
-	 * Reset all migrations (rollback all and run fresh)
+	 * Reset all migrations
 	 */
 	async resetMigrations(options = {}) {
 		const { seed = false, verbose = false } = options;
 		
-		console.log('\n🔄 Resetting database migrations...\n');
+		this.log('\nResetting database migrations...\n', false, 'info');
 		
 		await this.initDatabase();
 		
-		// Get all executed migrations
 		const [migrations] = await this.db.execute(
 			'SELECT migration FROM migrations ORDER BY batch DESC, id DESC'
 		);
 		
 		if (migrations.length > 0) {
-			console.log(`📋 Found ${migrations.length} migrations to rollback...\n`);
+			this.log(`Found ${migrations.length} migrations to rollback...\n`);
 			
-			// Rollback all migrations
 			const migrationsDir = path.join(this.ROOT, 'public/storage/database', 'migrations');
 			
 			for (const migration of migrations) {
 				const file = migration.migration;
 				
 				if (verbose) {
-					console.log(`   📝 Rolling back: ${file}`);
+					this.log(`Rolling back: ${file}`);
 				}
 				
 				try {
@@ -1918,34 +2480,32 @@ class App {
 					);
 					
 					if (!verbose) {
-						console.log(`   ✅ ${file}`);
+						this.log(`${file}`);
 					} else {
-						console.log(`   ✅ Rolled back: ${file}`);
+						this.log(`Rolled back: ${file}`);
 					}
 					
 				} catch (err) {
-					console.error(`   ❌ Failed to rollback: ${file}`);
-					console.error(`      Error: ${err.message}`);
+					this.log(`Failed to rollback: ${file}`, true, 'error');
+					this.log(`Error: ${err.message}`, false, 'error');
 					throw err;
 				}
 			}
 			
-			console.log(`\n✅ Rolled back ${migrations.length} migration(s)\n`);
+			this.log(`\nRolled back ${migrations.length} migration(s)\n`);
 		} else {
-			console.log('No migrations to rollback\n');
+			this.log('No migrations to rollback\n', false, 'info');
 		}
 		
-		// Run migrations fresh
-		console.log('🔄 Running fresh migrations...\n');
+		this.log('Running fresh migrations...\n', false, 'info');
 		await this.runMigrations({ verbose });
 		
-		// Run seeders if requested
 		if (seed) {
-			console.log('\n🌱 Running seeders...');
+			this.log('\nRunning seeders...', false, 'info');
 			await this.runSeeders({ force: true, verbose });
 		}
 		
-		console.log('\n✅ Database reset completed successfully');
+		this.log('\nDatabase reset completed successfully', false, 'info');
 	}
 
 	/**
@@ -1958,28 +2518,25 @@ class App {
 		const filename = `${timestamp}_${name}.mjs`;
 		const seedersDir = path.join(this.ROOT, 'public/storage/database', 'seeders');
 		
-		// Ensure seeders directory exists
 		await fs.ensureDir(seedersDir);
 		
 		const filepath = path.join(seedersDir, filename);
 		
-		// Get seeder template
 		let templateContent = await this.getSeederTemplate(name, timestamp);
 		
-		// Write the seeder file
 		await fs.writeFile(filepath, templateContent);
 		
 		if (verbose) {
-			console.log(`📝 Created seeder: ${filename}`);
+			this.log(`Created seeder: ${filename}`);
 		} else {
-			console.log(`   ✅ Created: ${filename}`);
+			this.log(`Created: ${filename}`);
 		}
 		
 		return filepath;
 	}
 
 	/**
-	 * Get seeder template content from partials folder
+	 * Get seeder template content
 	 */
 	async getSeederTemplate(name, timestamp) {
 		const templateContent = await this.templatesReader('seeders/default.js', {
@@ -1996,24 +2553,22 @@ class App {
 	async runSeeders(options = {}) {
 		const { seederClass, force = false, verbose = false } = options;
 		
-		// Ensure database is initialized
 		await this.initDatabase();
 		
 		try {
 			const seedersDir = path.join(this.ROOT, 'public/storage/database', 'seeders');
 			
 			if (!await fs.pathExists(seedersDir)) {
-				console.log('📁 No seeders directory found. Creating...');
+				this.log('No seeders directory found. Creating...', false, 'info');
 				await fs.ensureDir(seedersDir);
 				
-				// Create example seeder
 				const timestamp = new Date().toISOString();
 				const exampleSeeder = await this.templatesReader('seeders/example.js', {
 					timestamp: timestamp
 				});
 				
 				await fs.writeFile(path.join(seedersDir, 'ExampleSeeder.mjs'), exampleSeeder);
-				console.log('   📝 Created example seeder: ExampleSeeder.mjs');
+				this.log('   Created example seeder: ExampleSeeder.mjs', false, 'info');
 				return;
 			}
 			
@@ -2025,19 +2580,19 @@ class App {
 			}
 			
 			if (seederFiles.length === 0) {
-				console.log('No seeders found');
+				this.log('No seeders found', false, 'info');
 				return;
 			}
 			
-			console.log(`\n🌱 Running ${seederFiles.length} seeder(s)...\n`);
+			this.log(`\nRunning ${seederFiles.length} seeder(s)...\n`);
 			
 			let successCount = 0;
 			
 			for (const file of seederFiles) {
 				if (verbose) {
-					console.log(`   📝 Running: ${file}`);
+					this.log(`Running: ${file}`);
 				} else {
-					console.log(`   🌱 ${file}`);
+					this.log(`${file}`);
 				}
 				
 				try {
@@ -2052,15 +2607,15 @@ class App {
 					successCount++;
 					
 					if (verbose) {
-						console.log(`   ✅ Completed: ${file}`);
+						this.log(`Completed: ${file}`);
 					}
 					
 				} catch (err) {
-					console.error(`   ❌ Failed: ${file}`);
-					console.error(`      Error: ${err.message}`);
+					this.log(`Failed: ${file}`, true, 'error');
+					this.log(`Error: ${err.message}`, false, 'error');
 					
 					if (verbose && err.stack) {
-						console.error(err.stack);
+						this.log(err.stack, true, 'error');
 					}
 					
 					if (!force) {
@@ -2069,10 +2624,9 @@ class App {
 				}
 			}
 			
-			console.log(`\n✅ Seeders completed: ${successCount}/${seederFiles.length} succeeded`);
+			this.log(`\nSeeders completed: ${successCount}/${seederFiles.length} succeeded`);
 			
 		} finally {
-			// Close database connection
 			await this.closeDatabase();
 		}
 	}
@@ -2081,7 +2635,7 @@ class App {
 	 * Generate multiple services at once
 	 */
 	async generateServices(serviceNames, type = 'general') {
-		console.log('\n📝 Generating service classes...\n');
+		this.log('\nGenerating service classes...\n', false, 'info');
 
 		let created = 0;
 		let skipped = 0;
@@ -2103,14 +2657,14 @@ class App {
 				
 				results.push(result);
 			} catch (error) {
-				console.error(`   ❌ Failed to create service '${name}': ${error.message}`);
+				this.log(`Failed to create service '${name}': ${error.message}`, true, 'error');
 				if (this.options.verbose) {
-					console.error(error.stack);
+					this.log(error.stack, true, 'error');
 				}
 			}
 		}
 
-		console.log(`\n   Summary: ${created} created, ${skipped} already existed`);
+		this.log(`\n   Summary: ${created} created, ${skipped} already existed`, true, 'info');
 		
 		return {
 			created,
@@ -2125,27 +2679,23 @@ class App {
 	async createService(options) {
 		const { name, type = 'general', verbose } = options;
 
-		// Ensure name is in PascalCase
 		const className = name.charAt(0).toUpperCase() + name.slice(1);
 		const filename = `${className}.php`;
 		const servicesDir = path.join(this.ROOT, 'app', 'Services');
 
-		// Ensure services directory exists
 		await fs.ensureDir(servicesDir);
 
 		const filepath = path.join(servicesDir, filename);
 
-		// Check if service already exists
 		if (await fs.pathExists(filepath)) {
 			if (verbose) {
-				console.log(`   ⏭️  Service '${className}' already exists`);
+				this.log(`Service '${className}' already exists`);
 			} else {
-				console.log(`   ⏭️  ${className} already exists`);
+				this.log(`${className} already exists`);
 			}
 			return { name: className, path: filepath, created: false, skipped: true };
 		}
 
-		// Select template based on type
 		let templatePath;
 		const templateVariables = {
 			className: className,
@@ -2162,15 +2712,14 @@ class App {
 				break;
 		}
 
-		// Read the service template
 		let templateContent = await this.templatesReader(templatePath, templateVariables);
 		
 		await fs.writeFile(filepath, templateContent);
 
 		if (verbose) {
-			console.log(`   ✅ Created ${type} service: ${filename}`);
+			this.log(`Created ${type} service: ${filename}`);
 		} else {
-			console.log(`   ✅ ${className}`);
+			this.log(`${className}`);
 		}
 
 		return { name: className, path: filepath, created: true, skipped: false };
@@ -2180,20 +2729,17 @@ class App {
 		const runnerPath = path.join(this.ROOT, 'app/Services/MigrationRunner.php');
 		
 		if (!await fs.pathExists(runnerPath)) {
-			if (this.options.verbose) {
-				console.log('\n⚙️  MigrationRunner service not found. Creating...');
-			}
+			this.log('\nMigrationRunner service not found. Creating...', true);
 			
-			// Use createService with the migration type
 			await this.createService({
 				name: 'MigrationRunner',
 				type: 'migration',
 				verbose: false
 			});
 			
-			console.log('   ✅ MigrationRunner service auto-generated');
-		} else if (this.options.verbose) {
-			console.log('   ℹ️  MigrationRunner already exists');
+			this.log('   MigrationRunner service auto-generated', false, 'info');
+		} else {
+			this.log('   MigrationRunner already exists', true);
 		}
 	}
 
@@ -2203,9 +2749,7 @@ class App {
 	async closeDatabase() {
 		if (this.db) {
 			await this.db.end();
-			if (this.options.verbose) {
-				console.log('✅ Database connection closed');
-			}
+			this.log('Database connection closed', true);
 		}
 	}
 }

@@ -49,6 +49,11 @@ class CliService {
             .option('--controllers <controllers>', 'Controllers to generate (alias for --generate-controllers)')
             .option('--services <services>', 'Services to generate (alias for --generate-services)')
             .option('--type <type>', 'Service type (general or migration)', 'general')
+            .option('--include-dependencies', 'Include vendor/node_modules in deployment')
+            .option('--include-unstaged', 'Include unstaged changes in deployment (non-secure mode only)')
+            .option('--staged-only', 'Deploy only staged changes (non-secure mode only)')
+            .option('--no-untracked', 'Exclude untracked files from deployment')
+            .option('--full', 'Force full deployment instead of incremental')
             .action(async (options) => {
                 await this.handleRunCommand(options);
             });
@@ -63,15 +68,27 @@ class CliService {
             .option('--obfuscate', 'Obfuscate both JS and PHP files (redundant with --secure)')
             .option('--obfuscate-js', 'Obfuscate JavaScript files only')
             .option('--obfuscate-php', 'Obfuscate PHP files only')
-            .action(async (options) => {
+            .option('--include-dependencies', 'Include vendor/node_modules in deployment')
+            .option('--include-unstaged', 'Include unstaged changes in deployment (non-secure mode only)')
+            .option('--staged-only', 'Deploy only staged changes (non-secure mode only)')
+            .option('--no-untracked', 'Exclude untracked files from deployment')
+            .option('--full', 'Force full deployment instead of incremental')
+            .action(async (options) => { 
                 // Deploy always implies --deploy flag
                 const runOptions = {
                     ...options,
                     deploy: true,
                     // If --secure is set, force full obfuscation
                     obfuscateJs: options.secure ? true : (options.obfuscate || options.obfuscateJs),
-                    obfuscatePhp: options.secure ? true : (options.obfuscate || options.obfuscatePhp)
+                    obfuscatePhp: options.secure ? true : (options.obfuscate || options.obfuscatePhp),
+                    includeDependencies: options.includeDependencies ? true : false,
+                    includeUnstaged: options.includeUnstaged ? true : false,
+                    includeUntracked: options.untracked !== false, // Default true for secure mode
+                    stagedOnly: options.stagedOnly ? true : false,
+                    fullDeployment: options.full ? true : false
                 };
+
+
                 
                 // Re-trigger the run command action
                 await this.handleRunCommand(runOptions);
@@ -142,7 +159,7 @@ class CliService {
             // Execute based on operation type
             await this.executeOperation(parsedOptions);
 
-            console.log('✅ Operation completed successfully\n');
+            console.log(' ✅ Operation completed successfully\n');
 
         } catch (err) {
             this.handleError(err, options.verbose);
@@ -316,6 +333,11 @@ class CliService {
             obfuscateJs: shouldObfuscateJs,
             obfuscatePhp: shouldObfuscatePhp,
             onlyObfuscate: options.onlyObfuscate || (!shouldDeploy && (shouldObfuscateJs || shouldObfuscatePhp)),
+            includeDependencies: options.includeDependencies,
+            includeUnstaged: options.includeUnstaged,
+            includeUntracked: options.includeUntracked,
+            stagedOnly: options.stagedOnly,
+            fullDeployment: options.fullDeployment,
             preserveOriginals: options.preserveOriginals || false,
             jsSrcPath: options.jsSrc || 'public/js',
             jsDestPath: options.jsDest || 'public/orig',
@@ -324,6 +346,7 @@ class CliService {
             generateServices: services.length > 0,
             type: options.type || 'general',
             services: services
+
         }
 
         const serviceType = finalOptions.type || 'general';
@@ -715,11 +738,63 @@ class CliService {
         console.log('\n🔧 XFIX Operations Summary:');
         console.log('─'.repeat(40));
         
-        // Deployment
+        // Deployment 
         if (options.deploy) {
             console.log('📦 Deployment:');
-            console.log(`   • Mode: ${options.secure ? '🔒 Secure' : '📂 Standard'}`);
-            if (options.verbose) console.log('   • Verbose: Enabled');
+            
+            // Mode indicator
+            if (options.secure || options.obfuscateJs || options.obfuscatePhp) {
+                console.log('   • Mode: 🔒 Secure');
+                if (options.obfuscateJs && options.obfuscatePhp) {
+                    console.log('     ↳ 📜 JavaScript + 🐘 PHP Obfuscation');
+                } else if (options.obfuscateJs) {
+                    console.log('     ↳ 📜 JavaScript Obfuscation');
+                } else if (options.obfuscatePhp) {
+                    console.log('     ↳ 🐘 PHP Obfuscation');
+                }
+            } else {
+                console.log('   • Mode: 📂 Standard');
+            }
+            
+            // Deployment type
+            if (options.fullDeployment) {
+                console.log('   • Type: 📦 Full Deployment');
+            } else {
+                console.log('   • Type: 🔄 Incremental');
+            }
+            
+            // What's being included
+            if (options.includeUnstaged) {
+                console.log('   • Files: ⏳ Including Unstaged Changes');
+            }
+            
+            if (options.stagedOnly) {
+                console.log('   • Files: 📋 Staged Changes Only');
+            }
+            
+            if (options.includeDependencies) {
+                console.log('   • Dependencies: 📚 Including vendor/ & node_modules/');
+            } else {
+                console.log('   • Dependencies: ⏭️  Excluded (use --include-dependencies)');
+            }
+            
+            if (options.includeUntracked === false) {
+                console.log('   • Files: ⏭️  Excluding Untracked Files');
+            }
+            
+            // Verbose mode
+            if (options.verbose) {
+                console.log('   • Output: 📊 Verbose Enabled');
+            }
+            
+            // Server connection
+            if (options.secure) {
+                console.log('   • Connection: 🔐 Secure FTP');
+            } else {
+                console.log('   • Connection: 📤 Standard FTP');
+            }
+            
+            console.log('');
         }
 
         // Obfuscation
