@@ -891,6 +891,11 @@ class CliService {
         console.log('\n💡 Examples:');
         console.log('  #General:');
         console.log('  xfix run --deploy --secure --verbose');
+        console.log('  xfix run --deploy --secure --include-dependencies --verbose');
+        console.log('  xfix deploy --secure --include-dependencies --verbose');
+        console.log('  xfix deploy --include-dependencies --include-unstaged --verbose');
+        console.log('  xfix deploy --include-dependencies --staged-only --verbose');
+        console.log('  xfix deploy --include-unstaged --verbose');
         console.log('  xfix obfuscate --js --verbose');
         console.log('  xfix revert --php --verbose');
         console.log('  xfix dev generate controller UserController AdminController');
