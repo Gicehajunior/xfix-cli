@@ -12,6 +12,7 @@ import gulp from 'gulp';
 import javascriptObfuscator from 'gulp-javascript-obfuscator';
 import { promisify } from 'util';
 import { glob } from 'glob';
+import { simpleGit } from 'simple-git';
 import fg from 'fast-glob';
 import mysql from 'mysql2/promise';
 import pg from 'pg'; 
@@ -20,11 +21,16 @@ import { open } from 'sqlite';
 
 class App {
 	constructor(options = {}) {
+		// Path helpers as instance properties
+		this.ROOT = process.cwd();
+
 		// Promisify glob as instance method
 		this.globPromise = promisify(glob);
 
-		// Path helpers as instance properties
-		this.ROOT = process.cwd();
+		this.git = simpleGit(this.ROOT);
+		this.LAST_DEPLOY_FILE = path.join(this.ROOT, '.last-deploy');
+
+		this.config = {};
 
 		this.options = {
 			// Deployment options
@@ -71,7 +77,7 @@ class App {
 
 		const config = await fs.readJson(configPath);
 
-		return {
+		this.config = {
 			host: config.host,
 			username: config.username,
 			password: process.env.DEPLOY_PASSWORD || config.password,
@@ -91,6 +97,7 @@ class App {
 			runComposer: config.runComposer || false,
 			verbose: this.options.verbose || config.verbose || false,
 			framework: config.framework || '',
+			exclusiveFiles: config.exclude || [],
 			clientId: config.clientId || process.env.CLIENT_ID || process.env.XFIX_CLIENT_ID,
 			apiKey: config.apiKey || process.env.API_KEY || process.env.XFIX_API_KEY,
 
@@ -124,6 +131,8 @@ class App {
 			databaseConnectionLimit: config.databaseConnectionLimit || 10,
 			databaseQueueLimit: config.databaseQueueLimit || 0
 		};
+
+		return this.config;
 	}
 
 	validateConfig(config) {
@@ -146,7 +155,7 @@ class App {
 	/** 
 	 * FILE & IGNORE METHODS
 	*/
-	loadIgnore() {
+	loadIgnore() { 
 		const ig = ignore();
 		const ignoreFile = path.join(this.ROOT, '.updateignore');
 
@@ -156,8 +165,9 @@ class App {
 		}
 
 		// Always ignore these files
-		ig.add([
+		let exclusives = [
 			'.git',
+			'.last-deploy',
 			'.gitattributes',
 			'.updateignore',
 			'.xfixrc.json', 
@@ -190,8 +200,10 @@ class App {
 			'.git/',
 			'.svn/',
 			'.env.example'
-		]);
+		];
 
+		ig.add(exclusives);
+		
 		return ig;
 	}
 
@@ -219,9 +231,166 @@ class App {
 		return files.flat();
 	}
 
+	async updateDeployMarker() {
+		const hash = (await this.git.revparse(['HEAD'])).trim();
+		await fs.writeFile(this.LAST_DEPLOY_FILE, hash);
+	}
+
+	async getUpdatedFiles(config) {
+		let lastDeploy = null;
+	
+		if (await fs.pathExists(this.LAST_DEPLOY_FILE)) {
+			lastDeploy = (await fs.readFile(this.LAST_DEPLOY_FILE, 'utf-8')).trim();
+		}
+	
+		// First deploy - all tracked files
+		if (!lastDeploy) {
+			try {
+				const files = await this.git.raw(['ls-files']);
+				const changes = files
+					.trim()
+					.split('\n')
+					.filter(Boolean)
+					.map(f => ({
+						status: 'A',
+						file: f,
+						fullPath: path.join(this.ROOT, f)
+					}));
+	
+				this.options.total = changes.length;
+				this.options.included = changes.length;
+				this.options.excluded = 0;
+	
+				return changes;
+			} catch (error) {
+				throw new Error(`Failed to get initial file list: ${error.message}`);
+			}
+		}
+	
+		try {
+			// Git diff with enhanced options
+			const diff = await this.git.diff([
+				'--name-status',
+				'--diff-filter=ACMR',
+				`${lastDeploy}..HEAD`
+			]);
+	
+			const changes = diff
+				.trim()
+				.split('\n')
+				.filter(Boolean)
+				.map(line => {
+					const parts = line.split('\t');
+					const status = parts[0];
+	
+					// Handle renames (R100, R050, etc.)
+					if (status?.startsWith('R')) {
+						const similarity = status.substring(1);
+						const oldFile = parts[1];
+						const newFile = parts[2];
+	
+						if (!newFile) return null;
+	
+						return {
+							status: 'R',
+							similarity,
+							oldFile,
+							file: newFile,
+							fullPath: path.join(this.ROOT, newFile)
+						};
+					}
+	
+					// Handle copies
+					if (status?.startsWith('C')) {
+						const similarity = status.substring(1);
+						const oldFile = parts[1];
+						const newFile = parts[2];
+	
+						if (!newFile) return null;
+	
+						return {
+							status: 'C',
+							similarity,
+							oldFile,
+							file: newFile,
+							fullPath: path.join(this.ROOT, newFile)
+						};
+					}
+	
+					const file = parts[1];
+	
+					if (!file || typeof file !== 'string') return null;
+	
+					return {
+						status,
+						file,
+						fullPath: path.join(this.ROOT, file)
+					};
+				})
+				.filter(Boolean);
+	
+			// Get untracked files
+			const untracked = await this.git.raw([
+				'ls-files',
+				'--others',
+				'--exclude-standard'
+			]);
+	
+			const untrackedFiles = untracked
+				.trim()
+				.split('\n')
+				.filter(Boolean)
+				.map(file => ({
+					status: 'A',
+					file,
+					fullPath: path.join(this.ROOT, file)
+				}));
+	
+			const allChanges = [...changes, ...untrackedFiles];
+	
+			if (config.verbose) {
+				const statusCounts = allChanges.reduce((acc, change) => {
+					acc[change.status] = (acc[change.status] || 0) + 1;
+					return acc;
+				}, {});
+				
+				console.log('📊 Git detected changes:');
+				Object.entries(statusCounts).forEach(([status, count]) => {
+					const statusLabel = {
+						'A': 'Added',
+						'M': 'Modified',
+						'D': 'Deleted',
+						'R': 'Renamed',
+						'C': 'Copied'
+					}[status] || status;
+					console.log(`   ${statusLabel}: ${count} files`);
+				});
+			}
+	
+			// Update stats
+			this.options.total = allChanges.length;
+			this.options.included = allChanges.filter(c => c.status !== 'D').length;
+			this.options.excluded = allChanges.filter(c => c.status === 'D').length;
+	
+			return allChanges;
+		} catch (error) {
+			if (error.message.includes('unknown revision')) {
+				throw new Error(
+					`Deploy marker references invalid commit: ${lastDeploy}\n` +
+					'Try deleting .last-deploy file for full deployment'
+				);
+			}
+			throw error;
+		}
+	}
+
 	filterFiles(files, ig, config) {
-		const filtered = files.filter((file) => {
-			const rel = path.relative(this.ROOT, file);
+		const filtered = files.filter((changedFile) => {
+			let rel = path.relative(this.ROOT, changedFile);
+			if (!this.options.obfuscateJs || !config.obfuscateJs || !this.options.obfuscatePhp || !config.obfuscatePhp) {
+				rel = changedFile.file.replace(/\\/g, '/'); 
+			}
+
 			const isIgnored = ig.ignores(rel);
 
 			if (config.verbose && isIgnored) {
@@ -229,20 +398,9 @@ class App {
 			}
 
 			return !isIgnored;
-		});
+		}); 
 
-		this.options.total = files.length;
-		this.options.included = filtered.length;
-		this.options.excluded = files.length - filtered.length;
-
-		return {
-			files: filtered,
-			stats: {
-				total: files.length,
-				included: filtered.length,
-				excluded: files.length - filtered.length
-			}
-		};
+		return filtered;
 	}
 
 	/** 
@@ -417,7 +575,7 @@ class App {
 	 * OBFUSCATION METHODS
 	*/
 	get_excluded_js_files() {
-		return [
+		let excluded = [
 			'vendor.js',
 			'init.js',
 			'icons.min.js',
@@ -426,6 +584,28 @@ class App {
 			'jquery.js',
 			'jquery-ui.js'
 		];
+	
+		if (this.config?.exclusiveFiles?.length) {
+			this.config.exclusiveFiles.forEach(file => {
+				// Only exclude JavaScript files for obfuscation
+				if (file.endsWith('.js') || file.endsWith('.mjs') || file.endsWith('.cjs')) {
+					if (!excluded.includes(file)) {
+						excluded.push(file);
+						
+						if (this.config?.verbose) {
+							console.log(`   ⏭️  Excluding JS from obfuscation: ${file}`);
+						}
+					}
+				} else {
+					// For non-JS files, they'll be handled by the PHP obfuscation's ignore list
+					if (this.config?.verbose) {
+						console.log(`   ℹ️  Non-JS file in exclusiveFiles: ${file} (handled elsewhere)`);
+					}
+				}
+			});
+		}
+	
+		return excluded;
 	}
 
 	get_obfuscator_config(config) {
@@ -549,6 +729,16 @@ class App {
 
 		// Get ignore filter
 		const ig = this.loadIgnore();
+
+		if (this.config?.exclusiveFiles?.length) {
+			this.config.exclusiveFiles.forEach(file => {
+				ig.add(file);
+				
+				if (this.config?.verbose) {
+					console.log(`   ⏭️  Excluding from obfuscation: ${file}`);
+				}
+			});
+		}
 
 		// Scan for PHP files
 		let phpFiles = [];
@@ -979,7 +1169,8 @@ class App {
 			this.validateConfig(config);
 
 			// Create Services - Make services ready available in production
-			if (!config?.framework || config?.framework == 'selfphp') {
+			const framework = config?.framework || 'selfphp';
+			if (framework === 'selfphp') {
 				this.createService({
 					name: 'MigrationRunner',
 					type: 'migration',
@@ -1008,6 +1199,14 @@ class App {
 				await this.obfuscatePhp();
 			}
 
+			let secure = false;
+			if (this.options.obfuscateJs || 
+				config.obfuscateJs || 
+				this.options.obfuscatePhp || 
+				config.obfuscatePhp) {
+				secure = true;
+			}
+
 			// ============================================
 			// DEPLOYMENT PIPELINE
 			// ============================================
@@ -1017,33 +1216,51 @@ class App {
 
 			// Scan and filter files
 			console.log('\n📦 Scanning project files...');
-			const ig = this.loadIgnore();
-			const allFiles = await this.getAllFiles();
-			const {
-				files: allowedFiles,
-				stats
-			} = this.filterFiles(allFiles, ig, config);
+			const ig = this.loadIgnore(); 
+			
+			let files = await this.getUpdatedFiles(config); 
+			if (secure) {
+				// since secured files should not be commited
+				if (this.config?.verbose) {
+					console.log(`  ⏭️  Since you are using secure mode, full application scope compilation is going to be targeted...`);
+				}
 
-			this.options.total = stats.total;
-			this.options.included = stats.included;
-			this.options.excluded = stats.excluded;
+				files = await this.getAllFiles(); 
+			}
 
-			console.log(`   Found ${stats.total} files: ${stats.included} included, ${stats.excluded} excluded`);
+			let filePaths = this.filterFiles(files, ig, config);
 
-			if (!allowedFiles.length) {
+			// Extract file paths from change objects 
+			if (!secure) {
+				filePaths = filePaths.map(change => change.fullPath);
+			}
+
+			const total = files.length;
+			const included = filePaths.length;
+			const excluded = total - included;
+
+			this.options.total = total;
+			this.options.included = included;
+			this.options.excluded = excluded;
+
+			console.log(
+				`   Found ${total} changed files: ${included} included, ${excluded} excluded`
+			);
+
+			if (!included) {
 				throw new Error('No files to deploy. Check your .updateignore configuration.');
 			}
 
 			// Create archive
 			const zip_path = path.join(this.ROOT, 'deploy.zip');
 			console.log('\n📦 Creating archive...');
-			await this.createArchive(zip_path, allowedFiles, config);
+			await this.createArchive(zip_path, filePaths, config);
 
 			// Upload to server
 			console.log('\n🔗  Connecting to server...');
 			const client = new ftp.Client();
 			client.ftp.verbose = config.verbose;
-
+			
 			try {
 				await client.access({
 					host: config.host,
@@ -1074,6 +1291,10 @@ class App {
 			// Trigger remote deployment staging
 			console.log('');
 			await this.triggerDeploymentStaging(config.deployUrl, config);
+
+			if (!secure) {
+				await this.updateDeployMarker(); 
+			}
 
 			// Cleanup
 			await this.cleanup(zip_path, config);
