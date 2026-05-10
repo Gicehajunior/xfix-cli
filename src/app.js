@@ -77,7 +77,7 @@ class App {
 
 		const config = await fs.readJson(configPath);
 
-		return {
+		this.config = {
 			host: config.host,
 			username: config.username,
 			password: process.env.DEPLOY_PASSWORD || config.password,
@@ -131,6 +131,8 @@ class App {
 			databaseConnectionLimit: config.databaseConnectionLimit || 10,
 			databaseQueueLimit: config.databaseQueueLimit || 0
 		};
+
+		return this.config;
 	}
 
 	validateConfig(config) {
@@ -153,9 +155,7 @@ class App {
 	/** 
 	 * FILE & IGNORE METHODS
 	*/
-	async loadIgnore() {
-		this.config = await this.loadConfig();
-
+	loadIgnore() { 
 		const ig = ignore();
 		const ignoreFile = path.join(this.ROOT, '.updateignore');
 
@@ -201,16 +201,6 @@ class App {
 			'.svn/',
 			'.env.example'
 		];
-
-		if (this.config?.exclusiveFiles?.length) {
-			this.config.exclusiveFiles.forEach(file => {
-				exclusives.push(file);
-
-				if (this.config?.verbose) {
-					console.log(`  ⏭️  Added: ${file} to the ignore stack`);
-				}
-			});
-		}
 
 		ig.add(exclusives);
 		
@@ -585,7 +575,7 @@ class App {
 	 * OBFUSCATION METHODS
 	*/
 	get_excluded_js_files() {
-		return [
+		let excluded = [
 			'vendor.js',
 			'init.js',
 			'icons.min.js',
@@ -594,6 +584,28 @@ class App {
 			'jquery.js',
 			'jquery-ui.js'
 		];
+	
+		if (this.config?.exclusiveFiles?.length) {
+			this.config.exclusiveFiles.forEach(file => {
+				// Only exclude JavaScript files for obfuscation
+				if (file.endsWith('.js') || file.endsWith('.mjs') || file.endsWith('.cjs')) {
+					if (!excluded.includes(file)) {
+						excluded.push(file);
+						
+						if (this.config?.verbose) {
+							console.log(`   ⏭️  Excluding JS from obfuscation: ${file}`);
+						}
+					}
+				} else {
+					// For non-JS files, they'll be handled by the PHP obfuscation's ignore list
+					if (this.config?.verbose) {
+						console.log(`   ℹ️  Non-JS file in exclusiveFiles: ${file} (handled elsewhere)`);
+					}
+				}
+			});
+		}
+	
+		return excluded;
 	}
 
 	get_obfuscator_config(config) {
@@ -716,7 +728,17 @@ class App {
 		}
 
 		// Get ignore filter
-		const ig = await this.loadIgnore();
+		const ig = this.loadIgnore();
+
+		if (this.config?.exclusiveFiles?.length) {
+			this.config.exclusiveFiles.forEach(file => {
+				ig.add(file);
+				
+				if (this.config?.verbose) {
+					console.log(`   ⏭️  Excluding from obfuscation: ${file}`);
+				}
+			});
+		}
 
 		// Scan for PHP files
 		let phpFiles = [];
@@ -1194,7 +1216,7 @@ class App {
 
 			// Scan and filter files
 			console.log('\n📦 Scanning project files...');
-			const ig = await this.loadIgnore(); 
+			const ig = this.loadIgnore(); 
 			
 			let files = await this.getUpdatedFiles(config); 
 			if (secure) {
@@ -1210,7 +1232,7 @@ class App {
 
 			// Extract file paths from change objects 
 			if (!secure) {
-				filePaths = filtered.map(change => change.fullPath);
+				filePaths = filePaths.map(change => change.fullPath);
 			}
 
 			const total = files.length;
@@ -1270,7 +1292,9 @@ class App {
 			console.log('');
 			await this.triggerDeploymentStaging(config.deployUrl, config);
 
-			await this.updateDeployMarker(); 
+			if (!secure) {
+				await this.updateDeployMarker(); 
+			}
 
 			// Cleanup
 			await this.cleanup(zip_path, config);
