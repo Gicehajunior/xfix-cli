@@ -2133,14 +2133,18 @@ class App {
 			templateContent = templateContent.split(placeholder).join(value);
 		}
 		
-		// Remove backticks from template content
-		templateContent = templateContent.replace(/`/g, ''); 
+		const templatePathExt = templatePath.split('.').pop();
 
-		// Remove semicolons after closing braces
-		templateContent = templateContent.replace(/}(\s*);/g, '}$1');
-		
-		// Remove extra semicolons that became orphaned
-		templateContent = templateContent.replace(/^\s*;\s*$/gm, '');
+		if (templatePathExt === '.php') {
+			// Remove backticks from template content
+			templateContent = templateContent.replace(/`/g, ''); 
+
+			// Remove semicolons after closing braces
+			templateContent = templateContent.replace(/}(\s*);/g, '}$1');
+			
+			// Remove extra semicolons that became orphaned
+			templateContent = templateContent.replace(/^\s*;\s*$/gm, '');
+		}
 
 		return templateContent;
 	}
