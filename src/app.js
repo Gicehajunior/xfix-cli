@@ -746,6 +746,10 @@ class App {
 			excluded: excluded.length || (files.length - filtered.length)
 		};
 
+		this.options.total = stats['total'];
+		this.options.included = stats['included'];
+		this.options.excluded = stats['excluded'];
+
 		// Display summary
 		this.displayDeploymentSummary(filtered, stats, isSecure);
 
