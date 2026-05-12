@@ -7,9 +7,8 @@ import ftp from 'basic-ftp';
 import { execa } from 'execa';
 import fetch from 'node-fetch';
 import { fileURLToPath } from 'url';
-import { execSync } from 'child_process';
-import gulp from 'gulp';
-import javascriptObfuscator from 'gulp-javascript-obfuscator';
+import { execSync } from 'child_process'; 
+import JavaScriptObfuscator from 'javascript-obfuscator';
 import { promisify } from 'util';
 import { glob } from 'glob';
 import { simpleGit } from 'simple-git';
@@ -1229,15 +1228,44 @@ class App {
 	*/
 	get_excluded_js_files() {
 		let excluded = [
+
+			// Exact core libs
 			'vendor.js',
 			'init.js',
-			'icons.min.js',
-			'jquery.min.js',
-			'jquery-ui.min.js',
+		
+			// jQuery
 			'jquery.js',
-			'jquery-ui.js'
+			'jquery.min.js',
+			'jquery-ui.js',
+			'jquery-ui.min.js',
+		
+			// Icons
+			'icons.min.js',
+		
+			// General minified files
+			'**/*.min.js',
+		
+			// Vendor directories
+			'**/vendor/**',
+			'**/node_modules/**',
+		
+			// Large libraries
+			'**/ckeditor*/**',
+			'**/tinymce*/**',
+			'**/datatables*/**',
+			'**/chart*/**',
+		
+			// Build outputs
+			'**/dist/**',
+			'**/build/**',
+		
+			// Optional modern frameworks
+			'**/bootstrap*/**',
+			'**/select2*/**',
+			'**/moment*/**',
+			'**/fullcalendar*/**'
 		];
-	
+
 		if (this.config?.exclusiveFiles?.length) {
 			this.config.exclusiveFiles.forEach(file => {
 				// Only exclude JavaScript files for obfuscation
@@ -1302,48 +1330,116 @@ class App {
 			unicodeEscapeSequence: false
 		};
 	}
-
+	
 	async obfuscateJavaScript(srcPath, destPath, config) {
 		this.log('\nStarting JavaScript obfuscation...', false, 'info');
 		this.log(`Source: ${srcPath}`);
 		this.log(`Destination: ${destPath}`);
-
+	
 		if (config.domainLock && config.domainLock.length > 0) {
 			this.log(`Domain Lock: ${config.domainLock.join(', ')}`, false, 'lock');
 			this.log(`Redirect URL: ${config.domainLockRedirectUrl}`, false, 'info');
 		}
-
-		// Create destination directory if it doesn't exist
+	
+		// Create destination directory
 		await fs.ensureDir(destPath);
-
-		// Preserve originals if requested
+	
+		// Preserve originals
 		if (config.preserveOriginal) {
 			const preserveDir = config.preserveOriginal;
+	
 			if (fs.existsSync(srcPath)) {
 				await this.copy_folder_recursive(srcPath, preserveDir);
-				this.log(`Original files preserved in: ${preserveDir}`, false, 'backup');
+	
+				this.log(
+					`Original files preserved in: ${preserveDir}`,
+					false,
+					'backup'
+				);
 			}
 		}
-
+	
 		const exclude_files = this.get_excluded_js_files();
 		const obfuscator_config = this.get_obfuscator_config(config);
-
-		return new Promise((resolve, reject) => {
-			// Create a glob pattern that excludes specific files
-			const stream = gulp.src([
-					`${srcPath}/**/*.js`,
-					...exclude_files.map(f => `!${srcPath}/**/${f}`)
-				])
-				.pipe(javascriptObfuscator(obfuscator_config))
-				.pipe(gulp.dest(destPath))
-				.on('end', async () => {
-					// Copy excluded files as-is
-					await this.copy_excluded_js_files(srcPath, destPath, exclude_files);
-					this.log('JavaScript obfuscation completed', false, 'info');
-					resolve();
-				})
-				.on('error', reject);
+	
+		// Get all JS files
+		const files = glob.sync(`${srcPath}/**/*.js`, {
+			nodir: true
 		});
+	
+		for (const file of files) {
+			try {
+	
+				const relativePath = path.relative(srcPath, file);
+	
+				// Skip excluded files
+				const isExcluded = exclude_files.some(excluded =>
+					relativePath.includes(excluded)
+				);
+	
+				if (isExcluded) {
+					const destFile = path.join(destPath, relativePath);
+	
+					await fs.ensureDir(path.dirname(destFile));
+					await fs.copy(file, destFile);
+					if (config.verbose) {
+						this.log(`Skipped: ${relativePath}`, false, 'warning');
+					}
+
+					continue;
+				}
+	
+				// Skip large/minified/vendor files
+				const stat = await fs.stat(file);
+	
+				if (
+					stat.size > 1024 * 1024 || // 1MB+
+					file.includes('.min.js') ||
+					file.includes('/vendor/') ||
+					file.includes('/node_modules/')
+				) {
+					const destFile = path.join(destPath, relativePath);
+	
+					await fs.ensureDir(path.dirname(destFile));
+					await fs.copy(file, destFile);
+	
+					if (config.verbose) {
+						this.log(`Copied without obfuscation: ${relativePath}`, false, 'warning');
+					}
+
+					continue;
+				}
+	
+
+				if (config.verbose) {
+					this.log(`Obfuscating: ${relativePath}`);
+				}
+
+				// Read source
+				const code = await fs.readFile(file, 'utf8');
+	
+				// Obfuscate
+				const obfuscated = JavaScriptObfuscator
+						.obfuscate(code, obfuscator_config)
+						.getObfuscatedCode();
+	
+				// Write output
+				const destFile = path.join(destPath, relativePath);
+	
+				await fs.ensureDir(path.dirname(destFile));
+	
+				await fs.writeFile(destFile, obfuscated);
+	
+				// Release references
+				global.gc?.();
+	
+			} catch (error) {
+				this.log(`Failed: ${file}`, false, 'error');
+				console.error(error);
+			}
+		}
+	
+		this.log('JavaScript obfuscation completed', false, 'success');
 	}
 
 	async copy_excluded_js_files(srcPath, destPath, exclude_files) {

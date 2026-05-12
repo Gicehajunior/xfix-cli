@@ -8,13 +8,16 @@
     "xfix": "./bin/cli.js"
   },
   "scripts": {
-    "start": "node bin/cli.js",
-    "deploy": "xfix run --deploy",
-    "deploy:secure": "xfix run --deploy --secure",
-    "deploy:verbose": "xfix run --deploy --verbose",
-    "obfuscate": "xfix obfuscate --all",
-    "obfuscate:js": "xfix obfuscate --js",
-    "obfuscate:php": "xfix obfuscate --php",
+    "start": "cross-env NODE_OPTIONS=--max-old-space-size=8192 node bin/cli.js",
+  
+    "deploy": "cross-env NODE_OPTIONS=--max-old-space-size=8192 xfix run --deploy",
+    "deploy:secure": "cross-env NODE_OPTIONS=--max-old-space-size=8192 xfix run --deploy --secure",
+    "deploy:verbose": "cross-env NODE_OPTIONS=--max-old-space-size=8192 xfix run --deploy --verbose",
+  
+    "obfuscate": "cross-env NODE_OPTIONS=--max-old-space-size=8192 xfix obfuscate --all",
+    "obfuscate:js": "cross-env NODE_OPTIONS=--max-old-space-size=8192 xfix obfuscate --js",
+    "obfuscate:php": "cross-env NODE_OPTIONS=--max-old-space-size=8192 xfix obfuscate --php",
+  
     "dev:controller": "xfix dev generate controller",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
