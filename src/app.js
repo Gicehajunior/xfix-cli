@@ -1843,7 +1843,7 @@ class App {
 			}
 			
 			// Read the controller template 
-			let templateContent = await this.templatesReader('partials/controllers/template.php');
+			let templateContent = await this.templatesReader('controllers/template.php');
 			
 			await fs.writeFile(controller_file_path, templateContent);
 			this.log(`Controller '${controller_name}' generated`);
