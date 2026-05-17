@@ -1843,7 +1843,9 @@ class App {
 			}
 			
 			// Read the controller template 
-			let templateContent = await this.templatesReader('controllers/template.php');
+			let templateContent = await this.templatesReader('controllers/template.php', {
+				controller_name: controller_name
+			});
 			
 			await fs.writeFile(controller_file_path, templateContent);
 			this.log(`Controller '${controller_name}' generated`);
@@ -2230,8 +2232,8 @@ class App {
 		}
 		
 		const templatePathExt = templatePath.split('.').pop();
-
-		if (templatePathExt === '.php') {
+		
+		if (templatePathExt.trim() == 'php') {
 			// Remove backticks from template content
 			templateContent = templateContent.replace(/`/g, ''); 
 
