@@ -12,6 +12,7 @@ import JavaScriptObfuscator from 'javascript-obfuscator';
 import { promisify } from 'util';
 import { glob } from 'glob';
 import { simpleGit } from 'simple-git';
+import dns from "node:dns/promises";
 import fg from 'fast-glob';
 import mysql from 'mysql2/promise';
 import pg from 'pg'; 
@@ -68,7 +69,7 @@ class App {
 			excluded: null, 
 
 			...options
-		};
+		}; 
 	}
 	
 	/**
@@ -148,6 +149,7 @@ class App {
 			rejectUnauthorized: config.rejectUnauthorized || false,
 			maxRetries: config.maxRetries || 3,
 			retryDelay: config.retryDelay || 2000,
+			ftpTimeout: config.ftpTimeout || 120000, // 120 s
 			allowBackup: config.allowBackup || false,
 			cleanupLocal: config.cleanupLocal || false,
 			runMigrations: config.runMigrations || false,
@@ -189,6 +191,13 @@ class App {
 			databaseConnectionLimit: config.databaseConnectionLimit || 10,
 			databaseQueueLimit: config.databaseQueueLimit || 0
 		};
+
+		const { address } = await dns.lookup(
+			this.config.host,
+			{ family: 4 }
+		);
+
+		this.config.host = address;
 
 		return this.config;
 	}
@@ -1959,7 +1968,7 @@ class App {
 
 			// Upload to server
 			this.log('Connecting to server...', false, 'connect');
-			const client = new ftp.Client();
+			const client = new ftp.Client(config.ftpTimeout);
 			client.ftp.verbose = config.verbose;
 			
 			try {
