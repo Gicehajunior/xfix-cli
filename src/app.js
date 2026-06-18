@@ -4,8 +4,8 @@ import path from 'path';
 import ignore from 'ignore';
 import archiver from 'archiver';
 import ftp from 'basic-ftp';
-import { execa } from 'execa';
 import fetch from 'node-fetch';
+import { execa } from 'execa'; 
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process'; 
 import JavaScriptObfuscator from 'javascript-obfuscator';
@@ -13,6 +13,7 @@ import { promisify } from 'util';
 import { glob } from 'glob';
 import { simpleGit } from 'simple-git';
 import dns from "node:dns/promises";
+import https from 'https';
 import fg from 'fast-glob';
 import mysql from 'mysql2/promise';
 import pg from 'pg'; 
@@ -149,7 +150,7 @@ class App {
 			rejectUnauthorized: config.rejectUnauthorized || false,
 			maxRetries: config.maxRetries || 3,
 			retryDelay: config.retryDelay || 2000,
-			ftpTimeout: config.ftpTimeout || 120000, // 120 s
+			ftpTimeout: config.ftpTimeout || 0, // 120 s
 			allowBackup: config.allowBackup || false,
 			cleanupLocal: config.cleanupLocal || false,
 			runMigrations: config.runMigrations || false,
@@ -1151,25 +1152,27 @@ class App {
 		try {
 			const controller = new AbortController();
 			const timeout = setTimeout(() => controller.abort(), 300000);
+			const payload = {};
 
-			const formData = new URLSearchParams();
 			Object.entries(config).forEach(([key, value]) => {
 				if (value !== undefined && value !== null) {
-					if (typeof value === 'object') {
-						formData.append(key, JSON.stringify(value));
-					} else {
-						formData.append(key, String(value));
-					}
+					payload[key] = value;
 				}
+			});
+
+			const agent = new https.Agent({
+				family: 4,
+				keepAlive: true
 			});
 
 			const res = await fetch(deployUrl, {
 				method: 'POST',
+				agent,
 				signal: controller.signal,
-				body: formData,
+				body: JSON.stringify(payload),
 				headers: {
+					'Content-Type': 'application/json',
 					'User-Agent': 'XFIX-Deploy/1.0',
-					'Content-Type': 'application/x-www-form-urlencoded',
 					'X-API-Key': config.apiKey,
 					'XFIX-CLIENT-ID': config.clientId
 				}
@@ -1193,10 +1196,21 @@ class App {
 			}
 
 		} catch (error) {
+			// if (error.name === 'AbortError') {
+			// 	throw new Error('Remote deployment staging request timed out after 5 minutes');
+			// }
+			// throw new Error(`Remote deployment staging failed: ${error.message}`);
+			console.error('FETCH ERROR:', error);
+			console.error('NAME:', error.name);
+			console.error('MESSAGE:', error.message);
+			console.error('CODE:', error.code);
+			console.error('CAUSE:', error.cause);
+
 			if (error.name === 'AbortError') {
 				throw new Error('Remote deployment staging request timed out after 5 minutes');
 			}
-			throw new Error(`Remote deployment staging failed: ${error.message}`);
+
+			throw error;
 		}
 	}
 
