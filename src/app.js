@@ -1478,20 +1478,25 @@ class App {
 	}
 
 	async obfuscatePhp() {
-		this.log('\nStarting PHP obfuscation...', false, 'info');
+		this.log('\nStarting PHP obfuscation...', false, 'info'); 
 
 		// Check yakpro-po
 		let yakproPath;
+
 		try {
-			yakproPath = execSync('which yakpro-po', {
-				encoding: 'utf-8',
-				stdio: 'pipe'
-			}).trim();
+			const command = process.platform === 'win32'
+				? 'where.exe yakpro-po'
+				: 'which yakpro-po';
+
+			yakproPath = execSync(command, { encoding: 'utf-8' })
+				.split(/\r?\n/)[0]
+				.trim();
+
 			this.log(`Using: ${yakproPath}`);
 		} catch (error) {
 			throw new Error('yakpro-po is not installed.');
 		}
-
+		
 		// Get ignore filter
 		const includeDeps = this.options.includeDependencies || false;
 		const ig = this.loadIgnore(includeDeps);
@@ -1533,6 +1538,8 @@ class App {
 			const batch = phpFiles.slice(i, i + batchSize);
 
 			for (const file of batch) {
+				const cnfFile = 'yakpro-po.cnf'
+				const cnf = path.join(this.ROOT, cnfFile);
 				const sourcePath = path.join(this.ROOT, file);
 				const outputFile = path.join(this.ROOT, 'obfuscated', file);
 				const outputDir = path.dirname(outputFile);
@@ -1549,11 +1556,18 @@ class App {
 						`\r   [${processed + 1}/${total}] ${percent}% - ${displayFile.padEnd(40)}`
 					);
 
-					execSync(`"${yakproPath}" "${sourcePath}" -o "${outputFile}"`, {
-						stdio: 'pipe',
-						timeout: 60000
-					});
+					const cnfOption = await fs.pathExists(cnf)
+						? ` -c "${cnf}"`
+						: '';
 
+					execSync(
+						`"${yakproPath}" "${sourcePath}" -o "${outputFile}"${cnfOption}`,
+						{
+							stdio: 'pipe',
+							timeout: 60000
+						}
+					);
+					
 					processed++;
 
 				} catch (error) {
