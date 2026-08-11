@@ -1,6 +1,8 @@
 import { Command } from 'commander';
 import App from './app.js';
 import dotenv from 'dotenv';
+import fs from 'fs-extra';
+import path from 'path';
 
 dotenv.config();
 
@@ -8,7 +10,68 @@ class CliService {
     constructor() {
         this.program = new Command();
         this.applicationService = null;
+        this.config = null;
+        this.distributions = [];
+        this.currentDistribution = null;
         this.setup();
+    }
+
+    /**
+     * Load configuration from xfixrc.json
+     */
+    loadConfig() {
+        try {
+            const configPath = path.join(process.cwd(), '.xfixrc.json');
+            
+            if (!fs.existsSync(configPath)) {
+                console.error('❌ Configuration file not found: .xfixrc.json');
+                console.log('   Please create .xfixrc.json in your project root');
+                process.exit(1);
+            }
+
+            const configContent = fs.readFileSync(configPath, 'utf8');
+            this.config = JSON.parse(configContent);
+            
+            // Detect configuration type
+            if (this.config.distributions) {
+                // Multi-distribution mode
+                this.distributions = Object.entries(this.config.distributions).map(([name, config]) => ({
+                    name,
+                    ...config
+                }));
+                console.log(`📦 Multi-distribution mode: ${this.distributions.length} distributions found`);
+            } else {
+                // Single distribution mode (legacy)
+                this.distributions = [{
+                    name: 'default',
+                    ...this.config
+                }];
+                console.log('📦 Single distribution mode');
+            }
+
+            // Validate distributions
+            this.validateDistributions();
+
+            return this.distributions;
+        } catch (error) {
+            console.error('❌ Failed to load configuration:', error.message);
+            process.exit(1);
+        }
+    }
+
+    /**
+     * Validate all distributions have required fields
+     */
+    validateDistributions() {
+        const requiredFields = ['host', 'username', 'password', 'remotePath', 'deployPath'];
+        
+        for (const dist of this.distributions) {
+            const missing = requiredFields.filter(field => !dist[field]);
+            if (missing.length > 0) {
+                console.error(`❌ Distribution "${dist.name}" missing required fields: ${missing.join(', ')}`);
+                process.exit(1);
+            }
+        }
     }
 
     setup() {
@@ -17,12 +80,16 @@ class CliService {
             .description('XFIX CLI - Project Management & Deployment Tool')
             .version('1.0.0');
 
+        // Load config early
+        this.loadConfig();
+
         this.setupRunCommand();
         this.setupDeployCommand();
         this.setupDevCommand();
         this.setupObfuscateCommand();
         this.setupRevertCommand();
         this.setupDbMigrationsCommand();
+        this.setupMultiDistCommand();
 
         // Handle default help
         this.program.on('--help', () => {
@@ -30,11 +97,95 @@ class CliService {
         });
     }
 
+    /**
+     * New command for managing multiple distributions
+     */
+    setupMultiDistCommand() {
+        const multiCmd = this.program
+            .command('distributions')
+            .description('Manage multiple distributions');
+
+        // List all distributions
+        multiCmd
+            .command('list')
+            .description('List all configured distributions')
+            .option('--show-markers', 'Show deployment marker status')
+            .action(async (options) => {
+                await this.handleListDistributions(options);
+            });
+
+        // Reset deploy marker for a distribution
+        multiCmd
+            .command('reset-marker <name>')
+            .description('Reset deployment marker for a distribution')
+            .option('--verbose', 'Enable verbose output')
+            .action(async (name, options) => {
+                await this.handleResetMarker(name, options);
+            });
+
+        // Show deploy status for all distributions
+        multiCmd
+            .command('status')
+            .description('Show deployment status for all distributions')
+            .option('--verbose', 'Show detailed status')
+            .action(async (options) => {
+                await this.handleDistributionsStatus(options);
+            });
+
+        // Clean up old deploy markers
+        multiCmd
+            .command('clean-markers')
+            .description('Clean up orphaned deployment markers')
+            .option('--verbose', 'Enable verbose output')
+            .action(async (options) => {
+                await this.handleCleanMarkers(options);
+            });
+
+        // Deploy to specific distribution
+        multiCmd
+            .command('deploy <name>')
+            .description('Deploy to a specific distribution')
+            .option('--secure', 'Use secure mode')
+            .option('--verbose', 'Enable verbose output')
+            .option('--obfuscate', 'Obfuscate files')
+            .option('--include-dependencies', 'Include vendor/node_modules')
+            .option('--full', 'Force full deployment')
+            .option('--reset-marker', 'Reset deployment marker before deploy')
+            .action(async (name, options) => {
+                await this.handleDistributionDeploy(name, options);
+            });
+
+        // Deploy to all distributions
+        multiCmd
+            .command('deploy-all')
+            .description('Deploy to all distributions')
+            .option('--parallel', 'Deploy in parallel (experimental)')
+            .option('--verbose', 'Enable verbose output')
+            .option('--obfuscate', 'Obfuscate files')
+            .option('--include-dependencies', 'Include vendor/node_modules')
+            .option('--full', 'Force full deployment')
+            .option('--reset-markers', 'Reset deployment markers before deploy')
+            .action(async (options) => {
+                await this.handleDeployAll(options);
+            });
+
+        // Validate a distribution
+        multiCmd
+            .command('validate <name>')
+            .description('Validate connection to a distribution')
+            .option('--verbose', 'Enable verbose output')
+            .action(async (name, options) => {
+                await this.handleValidateDistribution(name, options);
+            });
+    }
+
     setupRunCommand() {
         this.program
             .command('run')
             .description('Run XFIX operations (deployment, obfuscation, development tools)')
             .option('--deploy', 'Run deployment pipeline')
+            .option('--distribution <name>', 'Deploy to specific distribution (multi-distribution mode)')
+            .option('--all-distributions', 'Deploy to all distributions (multi-distribution mode)')
             .option('--secure', 'Use secure FTP connection and enable full obfuscation (JS & PHP)')
             .option('--verbose', 'Enable verbose output')
             .option('--obfuscate', 'Obfuscate both JS and PHP files')
@@ -63,6 +214,8 @@ class CliService {
         this.program
             .command('deploy')
             .description('Quick deployment (shorthand for "run --deploy")')
+            .option('--distribution <name>', 'Deploy to specific distribution (multi-distribution mode)')
+            .option('--all-distributions', 'Deploy to all distributions (multi-distribution mode)')
             .option('--secure', 'Use secure FTP connection and enable full obfuscation (JS & PHP)')
             .option('--verbose', 'Enable verbose output')
             .option('--obfuscate', 'Obfuscate both JS and PHP files (redundant with --secure)')
@@ -74,23 +227,18 @@ class CliService {
             .option('--no-untracked', 'Exclude untracked files from deployment')
             .option('--full', 'Force full deployment instead of incremental')
             .action(async (options) => { 
-                // Deploy always implies --deploy flag
                 const runOptions = {
                     ...options,
                     deploy: true,
-                    // If --secure is set, force full obfuscation
                     obfuscateJs: options.secure ? true : (options.obfuscate || options.obfuscateJs),
                     obfuscatePhp: options.secure ? true : (options.obfuscate || options.obfuscatePhp),
                     includeDependencies: options.includeDependencies ? true : false,
                     includeUnstaged: options.includeUnstaged ? true : false,
-                    includeUntracked: options.untracked !== false, // Default true for secure mode
+                    includeUntracked: options.untracked !== false,
                     stagedOnly: options.stagedOnly ? true : false,
                     fullDeployment: options.full ? true : false
                 };
-
-
                 
-                // Re-trigger the run command action
                 await this.handleRunCommand(runOptions);
             });
     }
@@ -111,10 +259,9 @@ class CliService {
                 await this.handleControllerGeneration(controllers);
             }); 
 
-        // Create command - generate new service
         generateCommand
             .command('service <name...>')
-            .description('Generate one or more controllers')
+            .description('Generate one or more services')
             .option('--type <type>', 'Service type (general or migration)', 'general')
             .option('--verbose', 'Enable verbose output')
             .action(async (name, options) => {
@@ -137,29 +284,126 @@ class CliService {
                 await this.handleObfuscateCommand(options);
             });
     }
+
+    setupRevertCommand() {
+        this.program
+            .command('revert')
+            .description('Revert obfuscated files to original versions')
+            .option('--php', 'Revert PHP files only')
+            .option('--js', 'Revert JavaScript files only')
+            .option('--all', 'Revert both JS and PHP (default)')
+            .option('--verbose', 'Enable verbose output')
+            .action(async (options) => {
+                await this.handleRevertCommand(options);
+            });
+    }
+
+    setupDbMigrationsCommand() {
+        const dbCommand = this.program
+            .command('db')
+            .description('Database migration management');
     
+        dbCommand
+            .command('migrate')
+            .description('Run pending database migrations')
+            .option('--step <n>', 'Run specific number of migrations', parseInt)
+            .option('--dry-run', 'Show what would be executed without running')
+            .option('--verbose', 'Enable verbose output')
+            .action(async (options) => {
+                await this.handleDbMigrateCommand(options);
+            });
+    
+        dbCommand
+            .command('rollback')
+            .description('Rollback last migration or specific number of steps')
+            .option('--step <n>', 'Number of migrations to rollback', parseInt, 1)
+            .option('--target <name>', 'Rollback to specific migration')
+            .option('--dry-run', 'Show what would be rolled back')
+            .option('--verbose', 'Enable verbose output')
+            .action(async (options) => {
+                await this.handleDbRollbackCommand(options);
+            });
+    
+        dbCommand
+            .command('create <name>')
+            .description('Create a new migration file')
+            .option('--table <name>', 'Specify table name for the migration')
+            .option('--template <type>', 'Migration template type (create, alter, drop)', 'create')
+            .option('--lang <language>', 'Migration language (js or php)', 'js')
+            .option('--verbose', 'Enable verbose output')
+            .action(async (name, options) => {
+                await this.handleDbCreateCommand(name, options);
+            });
+    
+        dbCommand
+            .command('status')
+            .description('Show migration status (applied/pending)')
+            .option('--verbose', 'Show detailed information')
+            .action(async (options) => {
+                await this.handleDbStatusCommand(options);
+            });
+    
+        dbCommand
+            .command('reset')
+            .description('Rollback all migrations and run them again')
+            .option('--seed', 'Run seeders after reset')
+            .option('--force', 'Force reset in production')
+            .option('--verbose', 'Enable verbose output')
+            .action(async (options) => {
+                await this.handleDbResetCommand(options);
+            });
+    
+        dbCommand
+            .command('seed')
+            .description('Run database seeders')
+            .option('--class <name>', 'Specific seeder class to run')
+            .option('--force', 'Force seed in production')
+            .option('--verbose', 'Enable verbose output')
+            .action(async (options) => {
+                await this.handleDbSeedCommand(options);
+            });
+
+        dbCommand
+            .command('generate:seeder <name>')
+            .description('Create a new seeder file')
+            .option('--verbose', 'Enable verbose output')
+            .action(async (name, options) => {
+                await this.handleDbMakeSeederCommand(name, options);
+            });
+    }
 
     /**
      * Handle the main 'run' command
      */
     async handleRunCommand(options) {
         try {
-            // Parse options
             const parsedOptions = this.parseRunOptions(options);
-            
-            // Validate options
             this.validateOptions(parsedOptions);
             
-            // Display operation summary
-            this.displayOperationSummary(parsedOptions);
+            // Determine which distributions to deploy to
+            const targetDistributions = this.getTargetDistributions(options);
             
-            // Initialize deploy service
-            this.applicationService = new App(parsedOptions);
-            
-            // Execute based on operation type
-            await this.executeOperation(parsedOptions);
+            if (targetDistributions.length === 0) {
+                console.error('❌ No distributions found to deploy to');
+                console.log('   Available distributions:', this.distributions.map(d => d.name).join(', '));
+                process.exit(1);
+            }
 
-            console.log(' ✅ Operation completed successfully\n');
+            const isMultiDist = targetDistributions.length > 1 || this.distributions.length > 1;
+
+            if (isMultiDist && parsedOptions.deploy) {
+                await this.handleMultiDistributionDeploy(targetDistributions, parsedOptions);
+            } else if (parsedOptions.deploy) {
+                await this.handleSingleDistributionDeploy(targetDistributions[0], parsedOptions);
+            } else if (parsedOptions.generateControllers) {
+                await this.handleControllerGeneration(parsedOptions.controllers);
+            } else if (parsedOptions.generateServices) {
+                await this.handleServiceGeneration(parsedOptions.services, parsedOptions);
+            } else if (parsedOptions.obfuscateJs || parsedOptions.obfuscatePhp) {
+                await this.handleObfuscationOnly(parsedOptions);
+            }
+
+            console.log('\n✅ Operation completed successfully\n');
 
         } catch (err) {
             this.handleError(err, options.verbose);
@@ -167,19 +411,525 @@ class CliService {
     }
 
     /**
-     * Handle obfuscation-only command
+     * Get target distributions based on options
      */
-    async handleObfuscateCommand(options) {
+    getTargetDistributions(options) {
+        if (options.distribution) {
+            const dist = this.distributions.find(d => d.name === options.distribution);
+            if (!dist) {
+                console.error(`❌ Distribution "${options.distribution}" not found`);
+                console.log('   Available distributions:', this.distributions.map(d => d.name).join(', '));
+                process.exit(1);
+            }
+            return [dist];
+        }
+
+        if (options.allDistributions) {
+            return this.distributions;
+        }
+
+        if (this.distributions.length > 1) {
+            console.warn('⚠️  Multiple distributions configured but none specified');
+            console.warn(`   Deploying to first distribution: ${this.distributions[0].name}`);
+            console.warn('   Use --distribution <name> or --all-distributions to target specific ones');
+            return [this.distributions[0]];
+        }
+
+        return this.distributions;
+    }
+
+    /**
+     * Handle single distribution deployment
+     */
+    async handleSingleDistributionDeploy(distribution, options) {
+        console.log(`\n🚀 Deploying to: ${distribution.name}`);
+        console.log('─'.repeat(40));
+        console.log(`   Host: ${distribution.host}`);
+        console.log(`   Path: ${distribution.deployPath}`);
+        console.log('');
+
+        const mergedOptions = this.mergeConfigWithOptions(distribution, options);
+        this.displayOperationSummary(mergedOptions, distribution.name);
+        
+        this.applicationService = new App(mergedOptions);
+        await this.applicationService.deploy();
+    }
+
+    /**
+     * Handle multi-distribution deployment
+     */
+    async handleMultiDistributionDeploy(distributions, options) {
+        console.log(`\n🌐 Multi-Distribution Deployment`);
+        console.log('═'.repeat(50));
+        console.log(`📦 Deploying to ${distributions.length} distributions\n`);
+
+        const results = [];
+        const errors = [];
+
+        // Sequential execution (safer)
+        for (const dist of distributions) {
+            try {
+                console.log(`\n📦 Processing: ${dist.name}`);
+                console.log('─'.repeat(30));
+                
+                await this.deployToDistribution(dist, options);
+                results.push({ 
+                    distribution: dist.name, 
+                    success: true 
+                });
+                
+                console.log(`✅ ${dist.name} completed successfully`);
+            } catch (error) {
+                console.error(`❌ ${dist.name} failed:`, error.message);
+                errors.push({ 
+                    distribution: dist.name, 
+                    error: error 
+                });
+                
+                if (distributions.length > 1) {
+                    const shouldContinue = await this.promptContinue(
+                        `Continue with remaining distributions?`
+                    );
+                    if (!shouldContinue) {
+                        console.log('⏹️  Deployment aborted by user');
+                        break;
+                    }
+                }
+            }
+        }
+
+        this.displayMultiDistributionSummary(results, errors);
+    }
+
+        /**
+     * Handle listing distributions with marker status
+     */
+    async handleListDistributions(options) {
+        console.log('\n📋 Configured Distributions');
+        console.log('═'.repeat(60));
+        
+        const showMarkers = options.showMarkers || false;
+        
+        for (const dist of this.distributions) {
+            console.log(`\n${dist.name}`);
+            console.log(`   Host: ${dist.host}`);
+            console.log(`   Path: ${dist.deployPath}`);
+            console.log(`   Branch: ${dist.branch || 'develop'}`);
+            console.log(`   Mode: ${dist.secure ? '🔒 Secure' : '📂 Standard'}`);
+            
+            if (showMarkers) {
+                const app = new App({ 
+                    distributionName: dist.name,
+                    verbose: false 
+                });
+                
+                try {
+                    const status = await app.getDeployStatus();
+                    console.log(`   Marker: ${status.hasDeployed ? '✅' : '❌'} ${status.hasDeployed ? status.lastHash.substring(0, 8) : 'Not deployed'}`);
+                    console.log(`   Status: ${status.isUpToDate ? '✅ Up to date' : '🔄 Changes pending'}`);
+                } catch (error) {
+                    console.log(`   Marker: ⚠️ Error reading: ${error.message}`);
+                }
+            }
+            
+            if (dist.domainLock && dist.domainLock.length > 0) {
+                console.log(`   Domains: ${dist.domainLock.join(', ')}`);
+            }
+        }
+        
+        // Show marker files info
+        const app = new App({});
+        const markers = await app.listDeployMarkers();
+        
+        console.log(`\n📊 Summary:`);
+        console.log(`   Distributions: ${this.distributions.length}`);
+        console.log(`   Deploy Markers: ${markers.length}`);
+        
+        if (showMarkers) {
+            console.log('\n📁 Deploy Marker Files:');
+            for (const marker of markers) {
+                console.log(`   • ${marker.file}`);
+            }
+        }
+        
+        console.log('');
+    }
+
+    /**
+     * Handle resetting deployment marker
+     */
+    async handleResetMarker(name, options) {
+        const distribution = this.distributions.find(d => d.name === name);
+        if (!distribution) {
+            console.error(`❌ Distribution "${name}" not found`);
+            console.log('   Available distributions:', this.distributions.map(d => d.name).join(', '));
+            process.exit(1);
+        }
+
+        console.log(`\n🔄 Resetting deployment marker for: ${distribution.name}`);
+        console.log('─'.repeat(40));
+
+        const app = new App({ 
+            distributionName: distribution.name,
+            verbose: options.verbose || false 
+        });
+
+        try {
+            const markerPath = app.LAST_DEPLOY_FILE;
+            
+            if (await fs.pathExists(markerPath)) {
+                const content = await fs.readFile(markerPath, 'utf-8');
+                console.log(`   Current marker: ${content.trim().substring(0, 8)}`);
+                
+                const confirmed = await this.promptContinue(
+                    `Are you sure you want to reset the deployment marker for ${distribution.name}?`
+                );
+                
+                if (!confirmed) {
+                    console.log('❌ Reset cancelled');
+                    return;
+                }
+                
+                await app.resetDeployMarker();
+                console.log(`✅ Marker reset for ${distribution.name}`);
+                console.log(`   Next deployment will be a FULL deployment`);
+            } else {
+                console.log(`ℹ️  No marker found for ${distribution.name}`);
+            }
+        } catch (error) {
+            console.error(`❌ Failed to reset marker: ${error.message}`);
+            process.exit(1);
+        }
+    }
+
+    /**
+     * Handle showing deployment status for all distributions
+     */
+    async handleDistributionsStatus(options) {
+        console.log('\n📊 Deployment Status');
+        console.log('═'.repeat(60));
+
+        for (const dist of this.distributions) {
+            console.log(`\n${dist.name}:`);
+            console.log('─'.repeat(40));
+
+            const app = new App({ 
+                distributionName: dist.name,
+                verbose: options.verbose || false 
+            });
+
+            try {
+                const status = await app.getDeployStatus();
+                
+                if (status.hasDeployed) {
+                    console.log(`   Last Deploy: ${status.lastHash.substring(0, 8)}`);
+                    console.log(`   Current:     ${status.currentHash.substring(0, 8)}`);
+                    console.log(`   Status:      ${status.isUpToDate ? '✅ Up to date' : '🔄 Changes pending'}`);
+                    
+                    if (!status.isUpToDate && options.verbose) {
+                        // Show number of changed files
+                        const changes = await app.getUpdatedFiles({}, {
+                            includeUnstaged: false,
+                            includeUntracked: false,
+                            stagedOnly: false,
+                            includeCommitted: true
+                        });
+                        console.log(`   Changes:     ${changes.length} files`);
+                    }
+                } else {
+                    console.log(`   Status:      ❌ Never deployed`);
+                    console.log(`   Next deploy: Full deployment`);
+                }
+                
+                console.log(`   Marker File: ${path.basename(app.LAST_DEPLOY_FILE)}`);
+                
+            } catch (error) {
+                console.log(`   Status: ⚠️ Error: ${error.message}`);
+            }
+        }
+
+        // Summary
+        console.log(`\n📈 Summary:`);
+        const app = new App({});
+        const markers = await app.listDeployMarkers();
+        console.log(`   Total Distributions: ${this.distributions.length}`);
+        console.log(`   Deployed: ${markers.length}`);
+        console.log(`   Pending:  ${this.distributions.length - markers.length}`);
+        console.log('');
+    }
+
+    /**
+     * Handle cleaning up orphaned markers
+     */
+    async handleCleanMarkers(options) {
+        console.log('\n🧹 Cleaning Orphaned Markers');
+        console.log('═'.repeat(40));
+
+        const app = new App({ verbose: options.verbose || false });
+        const markers = await app.listDeployMarkers();
+        
+        const distributionNames = new Set(this.distributions.map(d => d.name));
+        const orphaned = markers.filter(m => !distributionNames.has(m.distribution));
+
+        if (orphaned.length === 0) {
+            console.log('✅ No orphaned markers found');
+            return;
+        }
+
+        console.log(`Found ${orphaned.length} orphaned marker(s):`);
+        for (const marker of orphaned) {
+            console.log(`   • ${marker.file}`);
+        }
+
+        const confirmed = await this.promptContinue(
+            `Delete ${orphaned.length} orphaned marker(s)?`
+        );
+
+        if (!confirmed) {
+            console.log('❌ Cleanup cancelled');
+            return;
+        }
+
+        for (const marker of orphaned) {
+            try {
+                const markerPath = path.join(process.cwd(), marker.file);
+                await fs.remove(markerPath);
+                console.log(`✅ Deleted: ${marker.file}`);
+            } catch (error) {
+                console.log(`❌ Failed to delete ${marker.file}: ${error.message}`);
+            }
+        }
+
+        console.log('\n✅ Cleanup completed');
+    }
+
+    /**
+     * Deploy to a single distribution with marker handling
+     */
+    async handleSingleDistributionDeploy(distribution, options) {
+        console.log(`\n🚀 Deploying to: ${distribution.name}`);
+        console.log('─'.repeat(40));
+        console.log(`   Host: ${distribution.host}`);
+        console.log(`   Path: ${distribution.deployPath}`);
+        console.log('');
+
+        // Optionally reset marker before deploy
+        if (options.resetMarker) {
+            console.log(`🔄 Resetting deployment marker for ${distribution.name}...`);
+            const app = new App({ 
+                distributionName: distribution.name,
+                verbose: options.verbose || false 
+            });
+            await app.resetDeployMarker();
+            console.log('   Marker reset for full deployment\n');
+        }
+
+        const mergedOptions = this.mergeConfigWithOptions(distribution, options);
+        this.displayOperationSummary(mergedOptions, distribution.name);
+        
+        this.applicationService = new App(mergedOptions);
+        await this.applicationService.deploy();
+
+        // Show marker status after deployment
+        const status = await this.applicationService.getDeployStatus();
+        console.log(`\n📌 Deploy marker updated to: ${status.currentHash.substring(0, 8)}`);
+        console.log(`   File: ${path.basename(this.applicationService.LAST_DEPLOY_FILE)}`);
+    }
+
+    /**
+     * Deploy to a single distribution
+     */
+    async deployToDistribution(distribution, options) {
+        const mergedOptions = this.mergeConfigWithOptions(distribution, options);
+        
+        console.log(`   Host: ${distribution.host}`);
+        console.log(`   Path: ${distribution.deployPath}`);
+        console.log(`   Mode: ${mergedOptions.secure ? '🔒 Secure' : '📂 Standard'}`);
+        console.log(`   Marker: ${distribution.name}.last-deploy`);
+        console.log('');
+
+        const app = new App(mergedOptions);
+        
+        // Show deployment status
+        const status = await app.getDeployStatus();
+        if (status.hasDeployed) {
+            console.log(`   Last deploy: ${status.lastHash.substring(0, 8)}`);
+            console.log(`   Current:     ${status.currentHash.substring(0, 8)}`);
+            console.log(`   Status:      ${status.isUpToDate ? '✅ Up to date' : '🔄 Changes pending'}`);
+        } else {
+            console.log('   Status:      ❌ Never deployed (full deployment)');
+        }
+        console.log('');
+
+        await app.deploy();
+        
+        console.log(`   ✅ ${distribution.name} deployed successfully`);
+        console.log(`   📌 Marker updated: ${status.currentHash.substring(0, 8)}`);
+    }
+
+    /**
+     * Deploy to a single distribution
+     */
+    async deployToDistribution(distribution, options) {
+        const mergedOptions = this.mergeConfigWithOptions(distribution, options);
+        
+        console.log(`   Host: ${distribution.host}`);
+        console.log(`   Path: ${distribution.deployPath}`);
+        console.log(`   Mode: ${mergedOptions.secure ? '🔒 Secure' : '📂 Standard'}`);
+        console.log('');
+
+        const app = new App(mergedOptions);
+        await app.deploy();
+        
+        console.log(`   ✅ ${distribution.name} deployed successfully`);
+    }
+
+    /**
+     * Merge distribution config with command options
+     */
+    mergeConfigWithOptions(distribution, options) {
+        return {
+            // From config (distribution)
+            host: distribution.host,
+            username: distribution.username,
+            password: process.env.DEPLOY_PASSWORD || distribution.password,
+            apiToken: distribution.apiToken,
+            remotePath: distribution.remotePath,
+            deployPath: distribution.deployPath,
+            branch: distribution.branch || 'develop',
+            cleanupLocal: distribution.cleanupLocal || false,
+            secure: distribution.secure || false,
+            rejectUnauthorized: distribution.rejectUnauthorized || false,
+            maxRetries: distribution.maxRetries || 3,
+            retryDelay: distribution.retryDelay || 2000,
+            deployUrl: distribution.deployUrl,
+            allowBackup: distribution.allowBackup || false,
+            runMigrations: distribution.runMigrations || false,
+            clearCache: distribution.clearCache || false,
+            runComposer: distribution.runComposer || false,
+            clientId: distribution.clientId || process.env.CLIENT_ID || process.env.XFIX_CLIENT_ID || '',
+            apiKey: distribution.apiKey || process.env.API_KEY || process.env.XFIX_API_KEY || '',
+            obfuscateJs: distribution.obfuscateJs || false,
+            obfuscatePhp: distribution.obfuscatePhp || false,
+            jsSrcPath: distribution.jsSrcPath || 'public/js',
+            jsDestPath: distribution.jsDestPath || 'public/orig',
+            preserveOriginal: distribution.preserveOriginal || 'public/original_js_asset_folder',
+            domainLock: distribution.domainLock || ['http://localhost', 'http://127.0.0.1'],
+            domainLockRedirectUrl: distribution.domainLockRedirectUrl || 'http://localhost',
+            exclude: distribution.exclude || ['vendor', 'node_modules', '.git', '.env'],
+            
+            // From command options (override config)
+            verbose: options.verbose || distribution.verbose || false,
+            secure: options.secure !== undefined ? options.secure : (distribution.secure || false),
+            obfuscate: options.obfuscate || false,
+            obfuscateJs: options.obfuscateJs !== undefined ? options.obfuscateJs : (distribution.obfuscateJs || false),
+            obfuscatePhp: options.obfuscatePhp !== undefined ? options.obfuscatePhp : (distribution.obfuscatePhp || false),
+            includeDependencies: options.includeDependencies !== undefined ? options.includeDependencies : false,
+            includeUnstaged: options.includeUnstaged !== undefined ? options.includeUnstaged : false,
+            includeUntracked: options.includeUntracked !== undefined ? options.includeUntracked : true,
+            stagedOnly: options.stagedOnly !== undefined ? options.stagedOnly : false,
+            fullDeployment: options.fullDeployment !== undefined ? options.fullDeployment : false,
+            preserveOriginals: options.preserveOriginals || false,
+            jsSrcPath: options.jsSrcPath || distribution.jsSrcPath || 'public/js',
+            jsDestPath: options.jsDestPath || distribution.jsDestPath || 'public/orig',
+            onlyObfuscate: options.onlyObfuscate || false,
+            generateControllers: options.generateControllers || false,
+            controllers: options.controllers || [],
+            generateServices: options.generateServices || false,
+            services: options.services || [],
+            type: options.type || 'general',
+            // Distribution metadata
+            distributionName: distribution.name,
+            distributionIndex: this.distributions.indexOf(distribution)
+        };
+    }
+
+    /**
+     * Handle distribution list
+     */
+    handleListDistributions() {
+        console.log('\n📋 Configured Distributions');
+        console.log('═'.repeat(50));
+        
+        this.distributions.forEach((dist, index) => {
+            console.log(`\n${index + 1}. ${dist.name}`);
+            console.log(`   Host: ${dist.host}`);
+            console.log(`   Path: ${dist.deployPath}`);
+            console.log(`   Branch: ${dist.branch || 'develop'}`);
+            console.log(`   Mode: ${dist.secure ? '🔒 Secure' : '📂 Standard'}`);
+            if (dist.domainLock && dist.domainLock.length > 0) {
+                console.log(`   Domains: ${dist.domainLock.join(', ')}`);
+            }
+        });
+        
+        console.log(`\n📊 Total: ${this.distributions.length} distributions\n`);
+    }
+
+    /**
+     * Handle deploying to specific distribution
+     */
+    async handleDistributionDeploy(name, options) {
+        const distribution = this.distributions.find(d => d.name === name);
+        if (!distribution) {
+            console.error(`❌ Distribution "${name}" not found`);
+            console.log('   Available distributions:', this.distributions.map(d => d.name).join(', '));
+            process.exit(1);
+        }
+
+        await this.handleSingleDistributionDeploy(distribution, options);
+    }
+
+    /**
+     * Handle deploy to all distributions
+     */
+    async handleDeployAll(options) {
+        await this.handleMultiDistributionDeploy(this.distributions, options);
+    }
+
+    /**
+     * Handle validating a distribution
+     */
+    async handleValidateDistribution(name, options) {
+        const distribution = this.distributions.find(d => d.name === name);
+        if (!distribution) {
+            console.error(`❌ Distribution "${name}" not found`);
+            console.log('   Available distributions:', this.distributions.map(d => d.name).join(', '));
+            process.exit(1);
+        }
+
+        console.log(`\n🔍 Validating distribution: ${distribution.name}`);
+        console.log('─'.repeat(40));
+        console.log(`   Host: ${distribution.host}`);
+        console.log(`   Path: ${distribution.deployPath}`);
+        console.log('');
+
+        try {
+            const app = new App({ 
+                ...distribution,
+                verbose: options.verbose || false 
+            });
+            
+            await app.testConnection();
+            console.log(`✅ Connection to ${distribution.name} successful`);
+        } catch (error) {
+            console.error(`❌ Connection to ${distribution.name} failed:`, error.message);
+            process.exit(1);
+        }
+    }
+
+    /**
+     * Handle obfuscation-only
+     */
+    async handleObfuscationOnly(options) {
         try {
             const obfuscateOptions = {
                 verbose: options.verbose || false,
                 onlyObfuscate: true,
                 preserveOriginals: options.preserveOriginals || false,
-                jsSrcPath: options.jsSrc || 'public/js',
-                jsDestPath: options.jsDest || 'public/orig',
-                obfuscateJs: options.all || options.js || (!options.js && !options.php),
-                obfuscatePhp: options.all || options.php || (!options.js && !options.php),
-                // No deployment
+                jsSrcPath: options.jsSrcPath || 'public/js',
+                jsDestPath: options.jsDestPath || 'public/orig',
+                obfuscateJs: options.obfuscateJs || false,
+                obfuscatePhp: options.obfuscatePhp || false,
                 deploy: false,
                 secure: false
             };
@@ -199,17 +949,23 @@ class CliService {
         }
     }
 
-    setupRevertCommand() {
-        this.program
-            .command('revert')
-            .description('Revert obfuscated files to original versions')
-            .option('--php', 'Revert PHP files only')
-            .option('--js', 'Revert JavaScript files only')
-            .option('--all', 'Revert both JS and PHP (default)')
-            .option('--verbose', 'Enable verbose output')
-            .action(async (options) => {
-                await this.handleRevertCommand(options);
-            });
+    /**
+     * Handle obfuscate command
+     */
+    async handleObfuscateCommand(options) {
+        const obfuscateOptions = {
+            verbose: options.verbose || false,
+            onlyObfuscate: true,
+            preserveOriginals: options.preserveOriginals || false,
+            jsSrcPath: options.jsSrc || 'public/js',
+            jsDestPath: options.jsDest || 'public/orig',
+            obfuscateJs: options.all || options.js || (!options.js && !options.php),
+            obfuscatePhp: options.all || options.php || (!options.js && !options.php),
+            deploy: false,
+            secure: false
+        };
+
+        await this.handleObfuscationOnly(obfuscateOptions);
     }
 
     /**
@@ -227,12 +983,10 @@ class CliService {
     
             const deployService = new App({ verbose: options.verbose || false });
             
-            // Revert PHP files
             if (shouldRevertPhp) {
                 await deployService.revert_php_obfuscation();
             }
             
-            // Revert JavaScript files
             if (shouldRevertJs) {
                 await deployService.revert_js_obfuscation();
             }
@@ -242,7 +996,7 @@ class CliService {
         } catch (err) {
             this.handleError(err, options.verbose);
         }
-    }    
+    }
 
     /**
      * Handle controller generation
@@ -272,7 +1026,6 @@ class CliService {
         try {
             const serviceType = options.type || 'general';
             
-            // Validation: migration type can only generate one service
             if (serviceType === 'migration' && services.length > 1) {
                 console.error('\n❌ Cannot generate multiple migration services');
                 console.log('   Migration type only supports a single service');
@@ -308,11 +1061,9 @@ class CliService {
         const shouldDeploy = options.deploy || false;
         const isSecure = options.secure || false;
         
-        // Secure mode always enables full obfuscation
         const shouldObfuscateJs = isSecure || options.obfuscate || options.obfuscateJs || false;
         const shouldObfuscatePhp = isSecure || options.obfuscate || options.obfuscatePhp || false;
         
-        // Parse controllers
         let controllers = [];
         const controllerArg = options.generateControllers || options.controllers;
         if (controllerArg) {
@@ -325,7 +1076,7 @@ class CliService {
             services = serviceArg.split(',').map(c => c.trim()).filter(Boolean);
         }
 
-        let finalOptions = {
+        return {
             deploy: shouldDeploy,
             secure: isSecure,
             verbose: options.verbose || false,
@@ -333,11 +1084,11 @@ class CliService {
             obfuscateJs: shouldObfuscateJs,
             obfuscatePhp: shouldObfuscatePhp,
             onlyObfuscate: options.onlyObfuscate || (!shouldDeploy && (shouldObfuscateJs || shouldObfuscatePhp)),
-            includeDependencies: options.includeDependencies,
-            includeUnstaged: options.includeUnstaged,
-            includeUntracked: options.includeUntracked,
-            stagedOnly: options.stagedOnly,
-            fullDeployment: options.fullDeployment,
+            includeDependencies: options.includeDependencies || false,
+            includeUnstaged: options.includeUnstaged || false,
+            includeUntracked: options.includeUntracked !== false,
+            stagedOnly: options.stagedOnly || false,
+            fullDeployment: options.full || false,
             preserveOriginals: options.preserveOriginals || false,
             jsSrcPath: options.jsSrc || 'public/js',
             jsDestPath: options.jsDest || 'public/orig',
@@ -346,30 +1097,13 @@ class CliService {
             generateServices: services.length > 0,
             type: options.type || 'general',
             services: services
-
-        }
-
-        const serviceType = finalOptions.type || 'general';
-            
-        // Validation: migration type can only generate one service
-        if (serviceType === 'migration' && services.length > 1) {
-            console.error('\n❌ Cannot generate multiple migration services');
-            console.log('   Migration type only supports a single service');
-            console.log('   Usage: xfix dev generate service MigrationRunner --type migration');
-            console.log('   Usage: xfix dev generate service EmailGateway,ExportGateway,PaymentGateway');
-            console.log('   Usage: xfix run --generate-services MigrationRunner --type migration');
-            console.log('   OR:    xfix run --generate-services EmailGateway,ExportGateway,PaymentGateway');
-            return;
-        }
-        
-        return finalOptions;
+        };
     }
 
     /**
      * Validate conflicting or invalid options
      */
     validateOptions(options) {
-        // --generate-controllers cannot be used with --deploy
         if (options.deploy && options.generateControllers && options.generateServices) {
             throw new Error(
                 '❌ Conflicting options: --generate-controllers cannot be used with --deploy\n' +
@@ -381,14 +1115,13 @@ class CliService {
             );
         }
 
-        // --only-obfuscate with --deploy makes no sense
         if (options.deploy && options.onlyObfuscate) {
             console.warn('⚠️  --only-obfuscate is redundant when --deploy is specified. Ignoring --only-obfuscate.');
             options.onlyObfuscate = false;
         }
 
-        // If no operations specified
-        if (!options.deploy && !options.obfuscateJs && !options.obfuscatePhp && !options.generateControllers && !options.generateServices) {
+        if (!options.deploy && !options.obfuscateJs && !options.obfuscatePhp && 
+            !options.generateControllers && !options.generateServices) {
             throw new Error(
                 '❌ No operations specified\n' +
                 '   Examples:\n' +
@@ -407,90 +1140,8 @@ class CliService {
         return options;
     }
 
-
-    setupDbMigrationsCommand() {
-        const dbCommand = this.program
-            .command('db')
-            .description('Database migration management');
-    
-        // Migrate command - run pending migrations
-        dbCommand
-            .command('migrate')
-            .description('Run pending database migrations')
-            .option('--step <n>', 'Run specific number of migrations', parseInt)
-            .option('--dry-run', 'Show what would be executed without running')
-            .option('--verbose', 'Enable verbose output')
-            .action(async (options) => {
-                await this.handleDbMigrateCommand(options);
-            });
-    
-        // Rollback command - revert last migration(s)
-        dbCommand
-            .command('rollback')
-            .description('Rollback last migration or specific number of steps')
-            .option('--step <n>', 'Number of migrations to rollback', parseInt, 1)
-            .option('--target <name>', 'Rollback to specific migration')
-            .option('--dry-run', 'Show what would be rolled back')
-            .option('--verbose', 'Enable verbose output')
-            .action(async (options) => {
-                await this.handleDbRollbackCommand(options);
-            });
-    
-        // Create command - generate new migration 
-        dbCommand
-            .command('create <name>')
-            .description('Create a new migration file')
-            .option('--table <name>', 'Specify table name for the migration')
-            .option('--template <type>', 'Migration template type (create, alter, drop)', 'create')
-            .option('--lang <language>', 'Migration language (js or php)', 'js')
-            .option('--verbose', 'Enable verbose output')
-            .action(async (name, options) => {
-                await this.handleDbCreateCommand(name, options);
-            });
-    
-        // Status command - show migration status
-        dbCommand
-            .command('status')
-            .description('Show migration status (applied/pending)')
-            .option('--verbose', 'Show detailed information')
-            .action(async (options) => {
-                await this.handleDbStatusCommand(options);
-            });
-    
-        // Reset command - rollback all and migrate fresh
-        dbCommand
-            .command('reset')
-            .description('Rollback all migrations and run them again')
-            .option('--seed', 'Run seeders after reset')
-            .option('--force', 'Force reset in production')
-            .option('--verbose', 'Enable verbose output')
-            .action(async (options) => {
-                await this.handleDbResetCommand(options);
-            });
-    
-        // Seed command - run database seeders
-        dbCommand
-            .command('seed')
-            .description('Run database seeders')
-            .option('--class <name>', 'Specific seeder class to run')
-            .option('--force', 'Force seed in production')
-            .option('--verbose', 'Enable verbose output')
-            .action(async (options) => {
-                await this.handleDbSeedCommand(options);
-            });
-
-        // Create command - generate new seeder
-        dbCommand
-            .command('generate:seeder <name>')
-            .description('Create a new seeder file')
-            .option('--verbose', 'Enable verbose output')
-            .action(async (name, options) => {
-                await this.handleDbMakeSeederCommand(name, options);
-            });
-    }
-
     /**
-     * Handle database migrate command
+     * Database command handlers
      */
     async handleDbMigrateCommand(options) {
         try {
@@ -511,10 +1162,7 @@ class CliService {
                 this.applicationService = new App({ verbose: migrationOptions.verbose });
             }
             
-            // Initialize database connection
             await this.applicationService.initDatabase();
-            
-            // Run migrations
             await this.applicationService.runMigrations(migrationOptions);
             
             if (migrationOptions.dryRun) {
@@ -528,9 +1176,6 @@ class CliService {
         }
     }
 
-    /**
-     * Handle database rollback command
-     */
     async handleDbRollbackCommand(options) {
         try {
             console.log('\n⏪ Database Rollback:');
@@ -561,14 +1206,9 @@ class CliService {
         }
     }
 
-    /**
-     * Handle database create migration command
-     */
     async handleDbCreateCommand(name, options) {
         try {
             const lang = options.lang || 'js';
-            
-            // Validate language
             const supportedLangs = ['js', 'php'];
             if (!supportedLangs.includes(lang)) {
                 console.error(`\n❌ Unsupported language: ${lang}`);
@@ -612,9 +1252,6 @@ class CliService {
         }
     }
 
-    /**
-     * Handle database status command
-     */
     async handleDbStatusCommand(options) {
         try {
             console.log('\n📊 Migration Status:');
@@ -632,9 +1269,6 @@ class CliService {
         }
     }
 
-    /**
-     * Handle database reset command
-     */
     async handleDbResetCommand(options) {
         try {
             console.log('\n🔄 Database Reset:');
@@ -646,7 +1280,6 @@ class CliService {
                 verbose: options.verbose || false
             };
             
-            // Check for production confirmation
             if (!resetOptions.force && process.env.NODE_ENV === 'production') {
                 console.error('\n❌ Cannot reset database in production without --force flag');
                 console.log('   Use: xfix db reset --force (if you really mean to do this)');
@@ -667,9 +1300,6 @@ class CliService {
         }
     }
 
-    /**
-     * Handle database make seeder command
-     */
     async handleDbMakeSeederCommand(name, options) {
         try {
             console.log('\n📝 Creating Seeder:');
@@ -696,9 +1326,6 @@ class CliService {
         }
     }
 
-    /**
-     * Handle database seed command
-     */
     async handleDbSeedCommand(options) {
         try {
             console.log('\n🌱 Running Seeders:');
@@ -710,7 +1337,6 @@ class CliService {
                 verbose: options.verbose || false
             };
             
-            // Check for production confirmation
             if (!seedOptions.force && process.env.NODE_ENV === 'production') {
                 console.error('\n❌ Cannot run seeders in production without --force flag');
                 console.log('   Use: xfix db seed --force (if you really mean to do this)');
@@ -732,17 +1358,19 @@ class CliService {
     }
 
     /**
-     * Display what operations will be performed
+     * Display operation summary
      */
-    displayOperationSummary(options) {
+    displayOperationSummary(options, distributionName = null) {
         console.log('\n🔧 XFIX Operations Summary:');
         console.log('─'.repeat(40));
         
-        // Deployment 
+        if (distributionName) {
+            console.log(`📦 Distribution: ${distributionName}`);
+        }
+        
         if (options.deploy) {
             console.log('📦 Deployment:');
             
-            // Mode indicator
             if (options.secure || options.obfuscateJs || options.obfuscatePhp) {
                 console.log('   • Mode: 🔒 Secure');
                 if (options.obfuscateJs && options.obfuscatePhp) {
@@ -756,20 +1384,10 @@ class CliService {
                 console.log('   • Mode: 📂 Standard');
             }
             
-            // Deployment type
             if (options.fullDeployment) {
                 console.log('   • Type: 📦 Full Deployment');
             } else {
                 console.log('   • Type: 🔄 Incremental');
-            }
-            
-            // What's being included
-            if (options.includeUnstaged) {
-                console.log('   • Files: ⏳ Including Unstaged Changes');
-            }
-            
-            if (options.stagedOnly) {
-                console.log('   • Files: 📋 Staged Changes Only');
             }
             
             if (options.includeDependencies) {
@@ -778,26 +1396,13 @@ class CliService {
                 console.log('   • Dependencies: ⏭️  Excluded (use --include-dependencies)');
             }
             
-            if (options.includeUntracked === false) {
-                console.log('   • Files: ⏭️  Excluding Untracked Files');
-            }
-            
-            // Verbose mode
             if (options.verbose) {
                 console.log('   • Output: 📊 Verbose Enabled');
-            }
-            
-            // Server connection
-            if (options.secure) {
-                console.log('   • Connection: 🔐 Secure FTP');
-            } else {
-                console.log('   • Connection: 📤 Standard FTP');
             }
             
             console.log('');
         }
 
-        // Obfuscation
         if (options.obfuscateJs || options.obfuscatePhp) {
             console.log('🔐 Obfuscation:');
             if (options.obfuscateJs) {
@@ -806,26 +1411,16 @@ class CliService {
                 console.log(`     Destination: ${options.jsDestPath}`);
             }
             if (options.obfuscatePhp) console.log('   • PHP: Enabled');
-            if (options.secure) console.log('   ℹ️  Full obfuscation enabled by --secure flag');
         }
 
-        // Controller Generation
         if (options.generateControllers) {
             console.log('📝 Controller Generation:');
             options.controllers.forEach(c => console.log(`   • ${c}`));
-            console.log('   ℹ️  Development mode only');
         }
 
-        // Service Generation
         if (options.generateServices) {
             console.log('📝 Service Generation:');
             options.services.forEach(c => console.log(`   • ${c}`));
-            console.log('   ℹ️  Development mode only');
-        }
-
-        // Operation mode
-        if (!options.deploy && (options.obfuscateJs || options.obfuscatePhp)) {
-            console.log('ℹ️  Mode: Obfuscation only (no deployment)');
         }
 
         console.log('─'.repeat(40));
@@ -833,22 +1428,53 @@ class CliService {
     }
 
     /**
-     * Execute the appropriate operation
+     * Display multi-distribution summary
      */
-    async executeOperation(options) {
-        if (options.deploy) {
-            // Full deployment pipeline
-            await this.applicationService.deploy();
-        } else if (options.generateControllers) {
-            // Controller generation only
-            await this.applicationService.generateControllers(options.controllers);
-        } else if (options.generateServices) {
-            // Controller generation only
-            await this.applicationService.generateServices(options.services);
-        } else if (options.obfuscateJs || options.obfuscatePhp) {
-            // Obfuscation only
-            await this.applicationService.obfuscateOnly();
+    displayMultiDistributionSummary(results, errors) {
+        console.log('\n📊 Multi-Distribution Deployment Summary');
+        console.log('═'.repeat(50));
+        
+        if (results.length > 0) {
+            console.log(`\n✅ Successful: ${results.length}`);
+            results.forEach(r => {
+                console.log(`   • ${r.distribution}`);
+            });
         }
+        
+        if (errors.length > 0) {
+            console.log(`\n❌ Failed: ${errors.length}`);
+            errors.forEach(e => {
+                console.log(`   • ${e.distribution}: ${e.error.message || e.error}`);
+            });
+        }
+        
+        const total = results.length + errors.length;
+        const successRate = total > 0 ? Math.round((results.length / total) * 100) : 0;
+        console.log(`\n📈 Success Rate: ${successRate}% (${results.length}/${total})`);
+        
+        if (errors.length === 0 && results.length > 0) {
+            console.log('🎉 All distributions deployed successfully!');
+        } else if (errors.length > 0) {
+            console.log('⚠️  Some distributions failed. Please check the errors above.');
+        }
+    }
+
+    /**
+     * Prompt user for confirmation
+     */
+    async promptContinue(message) {
+        const readline = await import('readline');
+        const rl = readline.createInterface({
+            input: process.stdin,
+            output: process.stdout
+        });
+
+        return new Promise((resolve) => {
+            rl.question(`${message} (y/N): `, (answer) => {
+                rl.close();
+                resolve(answer.toLowerCase() === 'y' || answer.toLowerCase() === 'yes');
+            });
+        });
     }
 
     /**
@@ -861,9 +1487,16 @@ class CliService {
         console.log('  xfix run --deploy                    # Simple deployment');
         console.log('  xfix run --deploy --secure           # Secure deployment + full obfuscation');
         console.log('  xfix deploy --secure                 # Shorthand for above');
-        console.log('  xfix obfuscate --all                 # Obfuscate everything');
-        console.log('  xfix revert --all                    # Revert obfuscated files');
-        console.log('  xfix dev generate controller User    # Generate a controller');
+        
+        if (this.distributions.length > 1) {
+            console.log('\n🌐 Multi-Distribution Commands:');
+            console.log('  xfix distributions list            # List all distributions');
+            console.log('  xfix distributions deploy <name>   # Deploy to specific distribution');
+            console.log('  xfix distributions deploy-all      # Deploy to all distributions');
+            console.log('  xfix distributions validate <name> # Validate connection');
+            console.log('  xfix run --deploy --distribution <name>  # Deploy to specific distribution');
+            console.log('  xfix run --deploy --all-distributions   # Deploy to all distributions');
+        }
         
         console.log('\n📋 Commands:');
         console.log('  run       Main command with multiple flags');
@@ -883,92 +1516,38 @@ class CliService {
         console.log('  --generate-services <names>  Generate services (dev only)');
         console.log('  --verbose             Show detailed output');
 
-        console.log('\n⚙️  Development Commands:');
-        console.log('  dev generate controller <names...>           Generate one or more controllers');
-        console.log('  dev generate service <names...>              Generate one or more service classes');
-        console.log('  dev generate service <name> --type migration Generate migration runner');
-        
         console.log('\n💡 Examples:');
-        console.log('  #General:');
+        console.log('  # General:');
         console.log('  xfix run --deploy --secure --verbose');
         console.log('  xfix run --deploy --secure --include-dependencies --verbose');
         console.log('  xfix deploy --secure --include-dependencies --verbose');
-        console.log('  xfix deploy --include-dependencies --include-unstaged --verbose');
-        console.log('  xfix deploy --include-dependencies --staged-only --verbose');
-        console.log('  xfix deploy --include-unstaged --verbose');
         console.log('  xfix obfuscate --js --verbose');
         console.log('  xfix revert --php --verbose');
-        console.log('  xfix dev generate controller UserController AdminController');
-        console.log('  xfix dev generate service User Admin');
-        console.log('  ');
-        console.log('  # Controllers');
-        console.log('  xfix dev generate controller UserController AdminController');
-        console.log('  ');
-        console.log('  # Services');
-        console.log('  xfix dev generate service PaymentGateway EmailService');
-        console.log('  xfix dev generate service MigrationRunner --type migration');
-        console.log('  ');
-        console.log('  # Multiple services (general only)');
-        console.log('  xfix dev generate service UserService RoleService PermissionService');
         
-        console.log('');
-
+        if (this.distributions.length > 1) {
+            console.log('\n  # Multi-Distribution:');
+            console.log('  xfix distributions list');
+            console.log('  xfix distributions deploy distribution_1 --secure --verbose');
+            console.log('  xfix distributions deploy-all --verbose');
+            console.log('  xfix run --deploy --distribution distribution_2 --secure');
+            console.log('  xfix run --deploy --all-distributions --verbose');
+        }
+        
         console.log('\n🗄️  Database Migration System:');
         console.log('─'.repeat(50));
-        console.log('\n📦 Migration Commands:');
         console.log('  db migrate              Run pending migrations');
         console.log('  db rollback             Rollback last migration(s)');
         console.log('  db create <name>        Create a new migration file');
         console.log('  db reset                Rollback all migrations and run fresh');
         console.log('  db status               Show migration status');
-
-        console.log('\n🌱 Seeder Commands:');
         console.log('  db seed                 Run database seeders');
         console.log('  db generate:seeder <name>   Create a new seeder file');
         
-        console.log('\n🎯 Options:');
-        console.log('  --step <n>              Number of migrations to run/rollback');
-        console.log('  --target <name>         Rollback to specific migration');
-        console.log('  --dry-run               Preview changes without executing');
-        console.log('  --table <name>          Specify table name for migration');
-        console.log('  --template <type>       Migration template (create, alter)');
-        console.log('  --class <name>          Run specific seeder class');
-        console.log('  --seed                  Run seeders after reset');
-        console.log('  --force                 Force operation in production');
-        console.log('  --verbose               Show detailed output');
-
         console.log('\n💡 Examples:');
-        console.log('  # Migrations');
-        console.log('  xfix db create <name>              Create a new migration');
-        console.log('  xfix db create <name> --lang php   Create a PHP migration');
-        console.log('  xfix db create <name> --table <t>  Specify table name');
-        console.log('  xfix db create <name> --template <type>  Template type (create, alter, drop)');
-        console.log('  xfix db migrate --step 5');
-        console.log('  xfix db migrate --dry-run --verbose');
-        console.log('  xfix db rollback --step 2');
-        console.log('  xfix db rollback --target 20260429104650_create_users_table'); 
-        console.log('  xfix db reset --seed');
-        console.log('  xfix db status --verbose');
-
-        console.log('\n💡 Examples:');
-        console.log('  # JavaScript migrations (default)');
         console.log('  xfix db create create_users_table --table users');
-        console.log('  xfix db create add_email_to_users --template alter --table users');
-        console.log('  xfix db create create_users_table --lang js --table users');
-        console.log('  ');
-        console.log('  # PHP migrations');
-        console.log('  xfix db create create_users_table --lang php --table users');
-        console.log('  xfix db create add_email_to_users --lang php --template alter --table users');
-        console.log('  xfix db create drop_old_table --lang php --template drop --table old_table');
-        
-        console.log('');
-
-        console.log('\n  # Seeders');
-        console.log('  xfix db seed');
+        console.log('  xfix db migrate --step 5');
+        console.log('  xfix db rollback --step 2');
         console.log('  xfix db seed --class UserSeeder');
-        console.log('  xfix db seed --force --verbose');
-        console.log('  xfix db generate:seeder UserSeeder');
-        console.log('  xfix db generate:seeder ProductSeeder');
     }
 
     /**
@@ -987,7 +1566,6 @@ class CliService {
      * Parse CLI arguments and execute
      */
     parse() {
-        // Show help if no arguments provided
         if (process.argv.length <= 2) {
             this.program.help();
             return;
