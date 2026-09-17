@@ -2106,7 +2106,7 @@ class App {
 						port: config.port || 22,
 						username: config.username,
 						password: config.password, 
-						readyTimeout: config.readyTimeout || 30000,           // 30s to complete handshake
+						readyTimeout: config.readyTimeout || 30000,
 						retries: config.maxRetries || 3,
 						retry_factor: config.retryFactor || 2,
 						retry_minTimeout: config.retryDelay || 2000,
@@ -2150,9 +2150,7 @@ class App {
 						accessOptions.secureOptions = {
 							rejectUnauthorized: config.rejectUnauthorized,
 						};
-					}
-
-					console.log('Connecting to FTP server with options:', accessOptions);
+					} 
 
 					client = new ftp.Client(config.ftpTimeout);
 
