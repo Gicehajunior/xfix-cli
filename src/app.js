@@ -4,6 +4,7 @@ import path from 'path';
 import ignore from 'ignore';
 import archiver from 'archiver';
 import ftp from 'basic-ftp';
+import SftpClient from 'ssh2-sftp-client';
 import fetch from 'node-fetch';
 import { execa } from 'execa'; 
 import { fileURLToPath } from 'url';
@@ -142,7 +143,9 @@ class App {
 		const config = this.options;
 
 		this.config = {
+			protocol: config.protocol || 'ftp',
 			host: config.host,
+			port: config.port || (config.protocol === 'sftp' ? 22 : 21),
 			username: config.username,
 			password: process.env.DEPLOY_PASSWORD || config.password,
 			remotePath: config.remotePath,
@@ -1205,9 +1208,17 @@ class App {
 
 		for (let attempt = 1; attempt <= config.maxRetries; attempt++) {
 			try {
-				this.log(`Upload attempt ${attempt}/${config.maxRetries}...`, false, 'upload');
+				this.log(
+					`Upload attempt ${attempt}/${config.maxRetries}...`,
+					false,
+					'upload'
+				);
 
-				await client.uploadFrom(localPath, remotePath);
+				if (config.protocol === 'sftp') {
+					await client.put(localPath, remotePath);
+				} else {
+					await client.uploadFrom(localPath, remotePath);
+				}
 
 				this.log('Upload complete', false, 'success');
 				return;
@@ -1215,13 +1226,20 @@ class App {
 				lastError = error;
 
 				if (attempt < config.maxRetries) {
-					this.log(`  Upload attempt ${attempt} failed, retrying in ${config.retryDelay/1000}s...`);
-					await new Promise(resolve => setTimeout(resolve, config.retryDelay));
+					this.log(
+						`  Upload attempt ${attempt} failed, retrying in ${config.retryDelay / 1000}s...`
+					);
+
+					await new Promise(resolve =>
+						setTimeout(resolve, config.retryDelay)
+					);
 				}
 			}
 		}
 
-		throw new Error(`Upload failed after ${config.maxRetries} attempts: ${lastError.message}`);
+		throw new Error(
+			`Upload failed after ${config.maxRetries} attempts: ${lastError.message}`
+		);
 	}
 
 	async triggerDeploymentStaging(deployUrl, config) {
@@ -2000,7 +2018,6 @@ class App {
 		}
 	}
 
-	
 	/**
 	 * Main deployment pipeline
 	 */
@@ -2076,50 +2093,109 @@ class App {
 
 			// Upload to server
 			this.log('Connecting to server...', false, 'connect');
-			const client = new ftp.Client(config.ftpTimeout);
-			client.ftp.verbose = config.verbose;
-			
+
+			let client;
+
 			try {
-				await client.access({
-					host: config.host,
-					user: config.username,
-					password: config.password,
-					secure: config.secure,
-					secureOptions: config.secure ? {
-						rejectUnauthorized: config.rejectUnauthorized
-					} : undefined
-				});
+				if (config.protocol === 'sftp') {
+					client = new SftpClient(); 
 
-				this.log('Connected to server', false, 'success');
+					const accessOptions = {
+						host: config.host,
+						port: config.port || 22,
+						username: config.username,
+						password: config.password, 
+						readyTimeout: config.readyTimeout || 30000,           // 30s to complete handshake
+						retries: config.maxRetries || 3,
+						retry_factor: config.retryFactor || 2,
+						retry_minTimeout: config.retryDelay || 2000,
+					};
 
-				if (config.verbose) {
-					client.trackProgress(info => {
-						this.log(`  Uploaded: ${(info.bytes / 1024).toFixed(1)}KB`, true, 'upload');
-					});
+					if (config.verbose) {
+						accessOptions.debug = message => {
+							console.log(`[SFTP] ${message}`);
+						};
+					}
+					
+					await client.connect(accessOptions);
+
+					this.log('Connected to server', false, 'success');
+
+					if (config.verbose) {
+						client.trackProgress(info => {
+							this.log(
+								`  ${info.name || 'Transfer'}: ${(info.bytes / 1024).toFixed(1)}KB`,
+								true,
+								'upload'
+							);
+						});
+					}
+				} else {
+					const accessOptions = {
+						host: config.host,
+						user: config.username,
+						password: config.password,
+						secure: config.secure,
+						secureOptions: config.secure ? {
+							rejectUnauthorized: config.rejectUnauthorized,
+						} : undefined,
+					};
+
+					if (config.port) {
+						accessOptions.port = config.port;
+					}
+
+					if (config.secure && config.rejectUnauthorized !== undefined) {
+						accessOptions.secureOptions = {
+							rejectUnauthorized: config.rejectUnauthorized,
+						};
+					}
+
+					console.log('Connecting to FTP server with options:', accessOptions);
+
+					client = new ftp.Client(config.ftpTimeout);
+
+					if (config.verbose) {
+						client.ftp.verbose = true;
+					}
+
+					await client.access(accessOptions);
+
+					this.log('Connected to server', false, 'success');
+
+					if (config.verbose) {
+						client.trackProgress(info => {
+							this.log(
+								`  Uploaded: ${(info.bytes / 1024).toFixed(1)}KB`,
+								true,
+								'upload'
+							);
+						});
+					}
 				}
 
-				const remote_file_path = path.posix.join(config.remotePath, 'deploy.zip');
-				await this.uploadWithRetry(client, zip_path, remote_file_path, config);
+				const remote_file_path = path.posix.join(
+					config.remotePath,
+					'deploy.zip'
+				);
 
+				await this.uploadWithRetry(
+					client,
+					zip_path,
+					remote_file_path,
+					config
+				);
 			} finally {
-				client.close();
-				this.log('	FTP connection closed', false, 'info');
+				if (client) {
+					if (config.protocol === 'sftp') {
+						await client.end();
+						this.log('SFTP connection closed', false, 'info');
+					} else {
+						client.close();
+						this.log('FTP connection closed', false, 'info');
+					}
+				}
 			}
-
-			// Trigger remote deployment staging
-			this.log(' ', false, 'space');
-			await this.triggerDeploymentStaging(config.deployUrl, config);
-
-			// Update deploy marker only for non-secure incremental deployments
-			if (!isSecure) {
-				await this.updateDeployMarker();
-			}
-
-			const duration = ((Date.now() - start_time) / 1000).toFixed(2);
-			this.log(`\nDeployment staged successfully in ${duration}s\n`, true, 'success');
-
-			// Cleanup after successful deployment
-			await this.cleanupAfterDeployment(true);
 
 		} catch (error) {
 			const zip_path = path.join(this.ROOT, 'deploy.zip');

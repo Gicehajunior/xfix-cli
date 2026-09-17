@@ -790,7 +790,9 @@ class CliService {
     mergeConfigWithOptions(distribution, options) {
         return {
             // From config (distribution)
+            protocol: distribution.protocol || 'ftp',
             host: distribution.host,
+            port: distribution.port || 21,
             username: distribution.username,
             password: process.env.DEPLOY_PASSWORD || distribution.password,
             apiToken: distribution.apiToken,
@@ -800,8 +802,11 @@ class CliService {
             cleanupLocal: distribution.cleanupLocal || false,
             secure: distribution.secure || false,
             rejectUnauthorized: distribution.rejectUnauthorized || false,
+            readyTimeout: distribution.readyTimeout || 30000,
+            retryFactor: distribution.retryFactor || 2,
             maxRetries: distribution.maxRetries || 3,
             retryDelay: distribution.retryDelay || 2000,
+            retryMinTimeout: distribution.retryMinTimeout || 2000,
             deployUrl: distribution.deployUrl,
             allowBackup: distribution.allowBackup || false,
             runMigrations: distribution.runMigrations || false,
