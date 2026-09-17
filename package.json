@@ -9,15 +9,12 @@
   },
   "scripts": {
     "start": "cross-env NODE_OPTIONS=--max-old-space-size=8192 node bin/cli.js",
-  
     "deploy": "cross-env NODE_OPTIONS=--max-old-space-size=8192 xfix run --deploy",
     "deploy:secure": "cross-env NODE_OPTIONS=--max-old-space-size=8192 xfix run --deploy --secure",
     "deploy:verbose": "cross-env NODE_OPTIONS=--max-old-space-size=8192 xfix run --deploy --verbose",
-  
     "obfuscate": "cross-env NODE_OPTIONS=--max-old-space-size=8192 xfix obfuscate --all",
     "obfuscate:js": "cross-env NODE_OPTIONS=--max-old-space-size=8192 xfix obfuscate --js",
     "obfuscate:php": "cross-env NODE_OPTIONS=--max-old-space-size=8192 xfix obfuscate --php",
-  
     "dev:controller": "xfix dev generate controller",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
@@ -39,6 +36,7 @@
     "simple-git": "^3.36.0",
     "sqlite": "^5.1.1",
     "sqlite3": "^6.0.1",
+    "ssh2-sftp-client": "^12.1.1",
     "vinyl-sourcemaps-apply": "^0.2.1"
   },
   "devDependencies": {

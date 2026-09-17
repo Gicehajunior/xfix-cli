@@ -4,6 +4,7 @@ import path from 'path';
 import ignore from 'ignore';
 import archiver from 'archiver';
 import ftp from 'basic-ftp';
+import SftpClient from 'ssh2-sftp-client';
 import fetch from 'node-fetch';
 import { execa } from 'execa'; 
 import { fileURLToPath } from 'url';
@@ -21,58 +22,68 @@ import sqlite3 from 'sqlite3';
 import { open } from 'sqlite';
 
 class App {
-	constructor(options = {}) {
-		// Path helpers as instance properties
-		this.ROOT = process.cwd();
+    constructor(options = {}) {
+        // Path helpers as instance properties
+        this.ROOT = process.cwd();
 
-		// Promisify glob as instance method
-		this.globPromise = promisify(glob);
+        // Promisify glob as instance method
+        this.globPromise = promisify(glob);
 
-		this.git = simpleGit(this.ROOT);
-		this.LAST_DEPLOY_FILE = path.join(this.ROOT, '.last-deploy');
+        this.git = simpleGit(this.ROOT);
+        
+        // Support per-distribution last deploy files
+        this.distributionName = options.distributionName || 'default';
+        this.LAST_DEPLOY_FILE = path.join(
+            this.ROOT, 
+            `.last-deploy-${this.distributionName}`
+        );
 
-		this.config = {};
+        this.config = {};
 
-		this.options = {
-			// Deployment options
-			deploy: false,
-			secure: false,
-			verbose: false,
+        this.options = {
+            // Deployment options
+            deploy: false,
+            secure: false,
+            verbose: false,
 
-			// Obfuscation options
-			obfuscateJs: false,
-			obfuscatePhp: false,
-			onlyObfuscate: false,
-			preserveOriginal: false,
+            // Obfuscation options
+            obfuscateJs: false,
+            obfuscatePhp: false,
+            onlyObfuscate: false,
+            preserveOriginal: false,
 
-			// Deploy options
-			includeDependencies: false,
-			includeUnstaged: false,
-			includeUntracked: false,
-			fullDeployment: false,
-			stagedOnly: false,
+            // Deploy options
+            includeDependencies: false,
+            includeUnstaged: false,
+            includeUntracked: false,
+            fullDeployment: false,
+            stagedOnly: false,
 
-			// Path options
-			jsSrcPath: 'public/js',
-			jsDestPath: 'public/orig',
+            // Path options
+            jsSrcPath: 'public/js',
+            jsDestPath: 'public/orig',
 
-			// Domain lock options
-			domainLock: [],
-			domainLockRedirectUrl: '',
+            // Domain lock options
+            domainLock: [],
+            domainLockRedirectUrl: '',
 
-			// Development options
-			generate_controllers: false,
-			controllers: [],
+            // Development options
+            generate_controllers: false,
+            controllers: [],
 
-			// Stats
-			total: null,
-			included: null,
-			excluded: null, 
+            // Stats
+            total: null,
+            included: null,
+            excluded: null,
 
-			...options
-		}; 
-	}
-	
+            // Distribution metadata
+            distributionName: 'default',
+            distributionIndex: 0,
+
+            ...options
+        };
+    }
+
 	/**
 	 * Logging helper for consistent verbose output
 	 * 
@@ -128,17 +139,13 @@ class App {
 	/** 
 	 * CONFIGURATION METHODS
 	*/
-	async loadConfig() {
-		const configPath = path.join(this.ROOT, '.xfixrc.json');
-
-		if (!(await fs.pathExists(configPath))) {
-			throw new Error('Configuration file .xfixrc.json not found in project root');
-		}
-
-		const config = await fs.readJson(configPath);
+	async loadConfig() { 
+		const config = this.options;
 
 		this.config = {
+			protocol: config.protocol || 'ftp',
 			host: config.host,
+			port: config.port || (config.protocol === 'sftp' ? 22 : 21),
 			username: config.username,
 			password: process.env.DEPLOY_PASSWORD || config.password,
 			remotePath: config.remotePath,
@@ -203,7 +210,7 @@ class App {
 		return this.config;
 	}
 
-	validateConfig(config) {
+	validateConfig(config) { 
 		const required = ['host', 'username', 'password', 'remotePath', 'deployPath'];
 		const missing = required.filter(key => !config[key]);
 
@@ -285,11 +292,6 @@ class App {
 		return ig;
 	}
 
-	async updateDeployMarker() {
-		const hash = (await this.git.revparse(['HEAD'])).trim();
-		await fs.writeFile(this.LAST_DEPLOY_FILE, hash);
-	}
-
 	filterFiles(files, ig) {
 		const filtered = [];
 		const excluded = [];
@@ -320,104 +322,188 @@ class App {
 			excluded
 		};
 	}
+	
+    /**
+     * Get the last deploy hash for the current distribution
+     */
+    async getLastDeployHash() {
+        try {
+            if (await fs.pathExists(this.LAST_DEPLOY_FILE)) {
+                return (await fs.readFile(this.LAST_DEPLOY_FILE, 'utf-8')).trim();
+            }
+            return null;
+        } catch (error) {
+            this.log(`Could not read last deploy file: ${error.message}`, true, 'warn');
+            return null;
+        }
+    }
 
-	async getUpdatedFiles(config, options = {}) {
-		const {
-			includeUnstaged = false,
-			includeUntracked = false,
-			stagedOnly = false,
-			includeCommitted = true
-		} = options;
-	
-		let lastDeploy = null;
-	
-		if (await fs.pathExists(this.LAST_DEPLOY_FILE)) {
-			lastDeploy = (await fs.readFile(this.LAST_DEPLOY_FILE, 'utf-8')).trim();
-		}
-	
-		// First deploy - all tracked files (only for non-secure mode)
-		if (!lastDeploy && includeCommitted) {
-			try {
-				const files = await this.git.raw(['ls-files']);
-				const changes = files
-					.trim()
-					.split('\n')
-					.filter(Boolean)
-					.map(f => ({
-						status: 'A',
-						file: f,
-						fullPath: path.join(this.ROOT, f),
-						committed: true,
-						staged: true
-					}));
-	
-				this.options.total = changes.length;
-				this.options.included = changes.length;
-				this.options.excluded = 0;
-	
-				return changes;
-			} catch (error) {
-				throw new Error(`Failed to get initial file list: ${error.message}`);
-			}
-		}
-	
-		try {
-			let allChanges = [];
-	
-			// Get committed changes if requested
-			if (includeCommitted && lastDeploy) {
-				const diffArgs = stagedOnly ? ['--cached'] : [];
-				const diff = await this.git.diff([
-					'--name-status',
-					'--diff-filter=ACMRT',
-					...diffArgs,
-					`${lastDeploy}..HEAD`
-				]);
-				
-				const committedChanges = this.parseDiffOutput(diff, { 
-					committed: true,
-					staged: true 
-				});
-				
-				allChanges.push(...committedChanges);
-			}
-	
-			// Get unstaged changes if requested
-			if (includeUnstaged) {
-				const unstagedChanges = await this.getUnstagedChanges();
-				allChanges.push(...unstagedChanges);
-			}
-	
-			// Get untracked files if requested
-			if (includeUntracked) {
-				const untrackedFiles = await this.getUntrackedFiles();
-				allChanges.push(...untrackedFiles);
-			}
-	
-			// Remove duplicates (a file might be both staged and unstaged)
-			allChanges = this.deduplicateChanges(allChanges);
-	
-			// Warn if no changes detected
-			if (allChanges.length === 0 && config.verbose) {
-				this.log('  No changes detected with current options', true, 'info');
-			}
-	
-			// Update stats and display
-			this.updateChangeStats(allChanges, config);
-			
-			return allChanges;
-	
-		} catch (error) {
-			if (error.message.includes('unknown revision')) {
-				throw new Error(
-					`Deploy marker references invalid commit: ${lastDeploy}\n` +
-					'Try deleting .last-deploy file for full deployment'
-				);
-			}
-			throw error;
-		}
-	}
-	
+    /**
+     * Update deploy marker for the current distribution
+     */
+    async updateDeployMarker() {
+        try {
+            const hash = (await this.git.revparse(['HEAD'])).trim();
+            await fs.writeFile(this.LAST_DEPLOY_FILE, hash);
+            this.log(`Updated deploy marker for ${this.distributionName}: ${hash.substring(0, 8)}`, true);
+        } catch (error) {
+            this.log(`Failed to update deploy marker: ${error.message}`, true, 'error');
+            throw error;
+        }
+    }
+
+    /**
+     * Get deployment marker status
+     */
+    async getDeployStatus() {
+        const lastHash = await this.getLastDeployHash();
+        const currentHash = (await this.git.revparse(['HEAD'])).trim();
+        
+        return {
+            lastHash,
+            currentHash,
+            isUpToDate: lastHash === currentHash,
+            hasDeployed: lastHash !== null
+        };
+    }
+
+    /**
+     * List all distribution deploy markers
+     */
+    async listDeployMarkers() {
+        const files = await fs.readdir(this.ROOT);
+        const markers = files
+            .filter(f => f.startsWith('.last-deploy-'))
+            .map(f => {
+                const distName = f.replace('.last-deploy-', '');
+                return {
+                    file: f,
+                    distribution: distName
+                };
+            });
+        
+        return markers;
+    }
+
+    /**
+     * Reset deploy marker for current distribution
+     */
+    async resetDeployMarker() {
+        try {
+            if (await fs.pathExists(this.LAST_DEPLOY_FILE)) {
+                await fs.remove(this.LAST_DEPLOY_FILE);
+                this.log(`Removed deploy marker for ${this.distributionName}`, true);
+                return true;
+            }
+            return false;
+        } catch (error) {
+            this.log(`Failed to reset deploy marker: ${error.message}`, true, 'error');
+            throw error;
+        }
+    }
+
+    /**
+     * Get updated files with per-distribution tracking
+     */
+    async getUpdatedFiles(config, options = {}) {
+        const {
+            includeUnstaged = false,
+            includeUntracked = false,
+            stagedOnly = false,
+            includeCommitted = true
+        } = options;
+
+        // Get last deploy hash for this distribution
+        let lastDeploy = await this.getLastDeployHash();
+
+        // First deploy - all tracked files (only for non-secure mode)
+        if (!lastDeploy && includeCommitted) {
+            try {
+                const files = await this.git.raw(['ls-files']);
+                const changes = files
+                    .trim()
+                    .split('\n')
+                    .filter(Boolean)
+                    .map(f => ({
+                        status: 'A',
+                        file: f,
+                        fullPath: path.join(this.ROOT, f),
+                        committed: true,
+                        staged: true
+                    }));
+
+                this.options.total = changes.length;
+                this.options.included = changes.length;
+                this.options.excluded = 0;
+
+                // Create initial deploy marker after first deployment
+                if (this.options.deploy) {
+                    await this.updateDeployMarker();
+                }
+
+                return changes;
+            } catch (error) {
+                throw new Error(`Failed to get initial file list: ${error.message}`);
+            }
+        }
+
+        try {
+            let allChanges = [];
+
+            // Get committed changes if requested
+            if (includeCommitted && lastDeploy) {
+                const diffArgs = stagedOnly ? ['--cached'] : [];
+                const diff = await this.git.diff([
+                    '--name-status',
+                    '--diff-filter=ACMRT',
+                    ...diffArgs,
+                    `${lastDeploy}..HEAD`
+                ]);
+                
+                const committedChanges = this.parseDiffOutput(diff, { 
+                    committed: true,
+                    staged: true 
+                });
+                
+                allChanges.push(...committedChanges);
+            }
+
+            // Get unstaged changes if requested
+            if (includeUnstaged) {
+                const unstagedChanges = await this.getUnstagedChanges();
+                allChanges.push(...unstagedChanges);
+            }
+
+            // Get untracked files if requested
+            if (includeUntracked) {
+                const untrackedFiles = await this.getUntrackedFiles();
+                allChanges.push(...untrackedFiles);
+            }
+
+            // Remove duplicates
+            allChanges = this.deduplicateChanges(allChanges);
+
+            // Warn if no changes detected
+            if (allChanges.length === 0 && config.verbose) {
+                this.log(`No changes detected for ${this.distributionName}`, true, 'info');
+            }
+
+            // Update stats and display
+            this.updateChangeStats(allChanges, config);
+            
+            return allChanges;
+
+        } catch (error) {
+            if (error.message.includes('unknown revision')) {
+                throw new Error(
+                    `Deploy marker for ${this.distributionName} references invalid commit: ${lastDeploy}\n` +
+                    'Try deleting .last-deploy file for full deployment'
+                );
+            }
+            throw error;
+        }
+    }
+
 	/**
 	 * Remove duplicate file entries, preferring unstaged versions
 	 */
@@ -1122,23 +1208,39 @@ class App {
 
 		for (let attempt = 1; attempt <= config.maxRetries; attempt++) {
 			try {
-				this.log(`Upload attempt ${attempt}/${config.maxRetries}...`, false, 'upload');
+				this.log(
+					`Upload attempt ${attempt}/${config.maxRetries}...`,
+					false,
+					'upload'
+				);
 
-				await client.uploadFrom(localPath, remotePath);
+				if (config.protocol === 'sftp') {
+					await client.put(localPath, remotePath);
+				} else {
+					await client.uploadFrom(localPath, remotePath);
+				}
 
 				this.log('Upload complete', false, 'success');
+				await this.triggerDeploymentStaging(config.deployUrl, config);
 				return;
 			} catch (error) {
 				lastError = error;
 
 				if (attempt < config.maxRetries) {
-					this.log(`  Upload attempt ${attempt} failed, retrying in ${config.retryDelay/1000}s...`);
-					await new Promise(resolve => setTimeout(resolve, config.retryDelay));
+					this.log(
+						`  Upload attempt ${attempt} failed, retrying in ${config.retryDelay / 1000}s...`
+					);
+
+					await new Promise(resolve =>
+						setTimeout(resolve, config.retryDelay)
+					);
 				}
 			}
 		}
 
-		throw new Error(`Upload failed after ${config.maxRetries} attempts: ${lastError.message}`);
+		throw new Error(
+			`Upload failed after ${config.maxRetries} attempts: ${lastError.message}`
+		);
 	}
 
 	async triggerDeploymentStaging(deployUrl, config) {
@@ -1195,11 +1297,7 @@ class App {
 				throw new Error(responseData.message || 'Unknown deployment error');
 			}
 
-		} catch (error) {
-			// if (error.name === 'AbortError') {
-			// 	throw new Error('Remote deployment staging request timed out after 5 minutes');
-			// }
-			// throw new Error(`Remote deployment staging failed: ${error.message}`);
+		} catch (error) { 
 			console.error('FETCH ERROR:', error);
 			console.error('NAME:', error.name);
 			console.error('MESSAGE:', error.message);
@@ -1207,10 +1305,11 @@ class App {
 			console.error('CAUSE:', error.cause);
 
 			if (error.name === 'AbortError') {
-				throw new Error('Remote deployment staging request timed out after 5 minutes');
+				console.log('STAGING ABORTION EXCEPTION: ', 'Remote deployment staging request timed out after 5 minutes');
+				return;
 			}
 
-			throw error;
+			console.log('STAGING ERROR EXCEPTION: ', error?.message || 'Remote deployment staging request timed out after 5 minutes')
 		}
 	}
 
@@ -1920,7 +2019,6 @@ class App {
 		}
 	}
 
-	
 	/**
 	 * Main deployment pipeline
 	 */
@@ -1996,50 +2094,102 @@ class App {
 
 			// Upload to server
 			this.log('Connecting to server...', false, 'connect');
-			const client = new ftp.Client(config.ftpTimeout);
-			client.ftp.verbose = config.verbose;
-			
+
+			let client;
+
 			try {
-				await client.access({
-					host: config.host,
-					user: config.username,
-					password: config.password,
-					secure: config.secure,
-					secureOptions: config.secure ? {
-						rejectUnauthorized: config.rejectUnauthorized
-					} : undefined
-				});
+				if (config.protocol === 'sftp') {
+					client = new SftpClient(); 
 
-				this.log('Connected to server', false, 'success');
+					const accessOptions = {
+						host: config.host,
+						port: config.port || 22,
+						username: config.username,
+						password: config.password, 
+						readyTimeout: config.readyTimeout || 30000,
+						retries: config.maxRetries || 3,
+						retry_factor: config.retryFactor || 2,
+						retry_minTimeout: config.retryDelay || 2000,
+					};
 
-				if (config.verbose) {
-					client.trackProgress(info => {
-						this.log(`  Uploaded: ${(info.bytes / 1024).toFixed(1)}KB`, true, 'upload');
-					});
+					if (config.verbose) {
+						accessOptions.debug = message => {
+							console.log(`[SFTP] ${message}`);
+						};
+					}
+					
+					await client.connect(accessOptions);
+
+					this.log('Connected to server', false, 'success');
+
+					if (config.verbose) {
+						client.trackProgress(info => {
+							this.log(
+								`  ${info.name || 'Transfer'}: ${(info.bytes / 1024).toFixed(1)}KB`,
+								true,
+								'upload'
+							);
+						});
+					}
+				} else {
+					const accessOptions = {
+						host: config.host,
+						user: config.username,
+						password: config.password,
+						secure: config.secure,
+						secureOptions: config.secure ? {
+							rejectUnauthorized: config.rejectUnauthorized,
+						} : undefined,
+					};
+
+					if (config.port) {
+						accessOptions.port = config.port;
+					}
+
+					if (config.secure && config.rejectUnauthorized !== undefined) {
+						accessOptions.secureOptions = {
+							rejectUnauthorized: config.rejectUnauthorized,
+						};
+					} 
+
+					client = new ftp.Client(config.ftpTimeout);
+
+					if (config.verbose) {
+						client.ftp.verbose = true;
+					}
+
+					await client.access(accessOptions);
+
+					this.log('Connected to server', false, 'success');
+
+					if (config.verbose) {
+						client.trackProgress(info => {
+							this.log(
+								`  Uploaded: ${(info.bytes / 1024).toFixed(1)}KB`,
+								true,
+								'upload'
+							);
+						});
+					}
 				}
 
-				const remote_file_path = path.posix.join(config.remotePath, 'deploy.zip');
+				const remote_file_path = path.posix.join(
+					config.remotePath,
+					'deploy.zip'
+				);
+
 				await this.uploadWithRetry(client, zip_path, remote_file_path, config);
-
 			} finally {
-				client.close();
-				this.log('	FTP connection closed', false, 'info');
+				if (client) {
+					if (config.protocol === 'sftp') {
+						await client.end();
+						this.log('SFTP connection closed', false, 'info');
+					} else {
+						client.close();
+						this.log('FTP connection closed', false, 'info');
+					}
+				}
 			}
-
-			// Trigger remote deployment staging
-			this.log(' ', false, 'space');
-			await this.triggerDeploymentStaging(config.deployUrl, config);
-
-			// Update deploy marker only for non-secure incremental deployments
-			if (!isSecure) {
-				await this.updateDeployMarker();
-			}
-
-			const duration = ((Date.now() - start_time) / 1000).toFixed(2);
-			this.log(`\nDeployment staged successfully in ${duration}s\n`, true, 'success');
-
-			// Cleanup after successful deployment
-			await this.cleanupAfterDeployment(true);
 
 		} catch (error) {
 			const zip_path = path.join(this.ROOT, 'deploy.zip');
