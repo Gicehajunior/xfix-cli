@@ -1221,6 +1221,7 @@ class App {
 				}
 
 				this.log('Upload complete', false, 'success');
+				await this.triggerDeploymentStaging(config.deployUrl, config);
 				return;
 			} catch (error) {
 				lastError = error;
@@ -2179,12 +2180,7 @@ class App {
 					'deploy.zip'
 				);
 
-				await this.uploadWithRetry(
-					client,
-					zip_path,
-					remote_file_path,
-					config
-				);
+				await this.uploadWithRetry(client, zip_path, remote_file_path, config);
 			} finally {
 				if (client) {
 					if (config.protocol === 'sftp') {
