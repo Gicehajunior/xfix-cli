@@ -1572,28 +1572,114 @@ class App {
 			}
 		}
 	}
-
+	
+	/**
+	 * Obfuscates PHP files using yakpro-po.
+	 * 
+	 * @returns {Promise<void>}
+	 */
 	async obfuscatePhp() {
-		this.log('\nStarting PHP obfuscation...', false, 'info'); 
+		this.log('\nStarting PHP obfuscation...', false, 'info');
+		
+		const localCandidates = process.platform === 'win32'
+			? [
+				// project root, directly
+				path.join(this.ROOT, 'yakpro-po.bat'),
+				path.join(this.ROOT, 'yakpro-po.cmd'),
+				path.join(this.ROOT, 'yakpro-po'),
 
-		// Check yakpro-po
-		let yakproPath;
+				// Composer-installed in this project
+				path.join(this.ROOT, 'vendor', 'bin', 'yakpro-po.bat'),
+				path.join(this.ROOT, 'vendor', 'bin', 'yakpro-po.cmd'),
 
-		try {
-			const command = process.platform === 'win32'
-				? 'where.exe yakpro-po'
-				: 'which yakpro-po';
+				// npm-installed in this project
+				path.join(this.ROOT, 'node_modules', '.bin', 'yakpro-po.cmd'),
+				path.join(this.ROOT, 'node_modules', '.bin', 'yakpro-po.bat'),
+			]
+			: [
+				// project root, directly
+				path.join(this.ROOT, 'yakpro-po'),
 
-			yakproPath = execSync(command, { encoding: 'utf-8' })
-				.split(/\r?\n/)[0]
-				.trim();
+				// Composer-installed in this project
+				path.join(this.ROOT, 'vendor', 'bin', 'yakpro-po'),
 
-			this.log(`Using: ${yakproPath}`);
-		} catch (error) {
-			throw new Error('yakpro-po is not installed.');
+				// npm-installed in this project
+				path.join(this.ROOT, 'node_modules', '.bin', 'yakpro-po'),
+			];
+
+		let yakproPath = null;
+		let yakproSource = null;
+
+		for (const candidate of localCandidates) {
+			if (await fs.pathExists(candidate)) {
+				yakproPath = candidate;
+				yakproSource = 'project-local';
+				break;
+			}
+		}
+
+		if (!yakproPath) {
+			try {
+				const command = process.platform === 'win32'
+					? 'where.exe yakpro-po'
+					: 'which yakpro-po';
+
+				const found = execSync(command, { encoding: 'utf-8' })
+					.split(/\r?\n/)
+					.map(line => line.trim())
+					.filter(Boolean);
+
+				if (found.length === 0) throw new Error('not found');
+
+				yakproPath = found[0];
+				yakproSource = 'global';
+			} catch (error) {
+				throw new Error(
+					'yakpro-po not found.\n' +
+					'  Expected at vendor/bin/yakpro-po(.bat) or on PATH.\n' +
+					'  Install with: composer require --dev eddiekidiw/yakpro-po'
+				);
+			}
+		}
+
+		if (yakproSource === 'project-local') {
+			this.log(`Using (project-local): ${path.relative(this.ROOT, yakproPath)}`, false, 'info');
+		} else {
+			this.log(`Using (global): ${yakproPath}`, false, 'warn');
+			this.log(
+				'  Tip: install yakpro-po into this project for reproducible builds:\n' +
+				'       composer require --dev eddiekidiw/yakpro-po',
+				false, 'warn'
+			);
 		}
 		
-		// Get ignore filter
+		const cnf = path.join(this.ROOT, 'yakpro-po.cnf');
+
+		if (!await fs.pathExists(cnf)) {
+			throw new Error(
+				`yakpro-po.cnf not found at ${cnf}. ` +
+				'Place the config in the project root or remove PHP obfuscation.'
+			);
+		}
+
+		// Verify the magic marker on line 2 — otherwise yakpro silently
+		// falls back to the packaged default and mangles class names.
+		const cnfHead = (await fs.readFile(cnf, 'utf-8'))
+			.split(/\r?\n/)
+			.slice(0, 2);
+
+		if (cnfHead[1]?.trim() !== '// YAK Pro - Php Obfuscator: Config File') {
+			throw new Error(
+				`Invalid yakpro-po config: ${cnf}\n` +
+				'  Line 2 must be exactly: // YAK Pro - Php Obfuscator: Config File\n' +
+				`  Found: ${JSON.stringify(cnfHead[1])}\n` +
+				'  Without this marker, yakpro silently ignores the file ' +
+				'and uses its packaged default (which scrambles class names).'
+			);
+		}
+
+		this.log(`Config: ${path.relative(this.ROOT, cnf)}`, true);
+		
 		const includeDeps = this.options.includeDependencies || false;
 		const ig = this.loadIgnore(includeDeps);
 
@@ -1604,15 +1690,11 @@ class App {
 			});
 		}
 
-		// Scan for PHP files
 		let phpFiles = [];
-
 		try {
 			phpFiles = await this.scan_php_files_with_ignore(ig);
-			this.log(`Found ${phpFiles.length} PHP files to obfuscate`, true, 'info');
 		} catch (error) {
-			this.log(`File scan failed: ${error.message}`, true, 'error');
-			return;
+			throw new Error(`PHP file scan failed: ${error.message}`);
 		}
 
 		if (phpFiles.length === 0) {
@@ -1620,90 +1702,108 @@ class App {
 			return;
 		}
 
-		// Process files
+		this.log(`Found ${phpFiles.length} PHP files to obfuscate`, false, 'info');
+		
 		let processed = 0;
 		let failed = 0;
 		const total = phpFiles.length;
 		const startTime = Date.now();
 		const failedFiles = [];
 
-		// Obfuscate all files to obfuscated/ directory
-		const batchSize = 5;
+		const obfuscatedRoot = path.join(this.ROOT, 'obfuscated');
 
-		for (let i = 0; i < phpFiles.length; i += batchSize) {
-			const batch = phpFiles.slice(i, i + batchSize);
+		// Wipe any stale output from a previous aborted run
+		if (await fs.pathExists(obfuscatedRoot)) {
+			await fs.remove(obfuscatedRoot);
+		}
 
-			for (const file of batch) {
-				const cnfFile = 'yakpro-po.cnf'
-				const cnf = path.join(this.ROOT, cnfFile);
-				const sourcePath = path.join(this.ROOT, file);
-				const outputFile = path.join(this.ROOT, 'obfuscated', file);
-				const outputDir = path.dirname(outputFile);
+		for (let index = 0; index < phpFiles.length; index++) {
+			const file = phpFiles[index];
+			const sourcePath = path.join(this.ROOT, file);
+			const outputFile = path.join(obfuscatedRoot, file);
+			const outputDir = path.dirname(outputFile);
 
-				try {
-					await fs.ensureDir(outputDir);
+			try {
+				// yakpro 2.0.14 does NOT create the output dir itself
+				await fs.ensureDir(outputDir);
 
-					const percent = Math.round(((processed + 1) / total) * 100);
-					const displayFile = file.length > 40 ?
-						'...' + file.substring(file.length - 37) :
-						file;
+				const percent = Math.round(((index + 1) / total) * 100);
+				const displayFile = file.length > 40
+					? '...' + file.substring(file.length - 37)
+					: file;
 
-					process.stdout.write(
-						`\r   [${processed + 1}/${total}] ${percent}% - ${displayFile.padEnd(40)}`
+				process.stdout.write(
+					`\r   [${index + 1}/${total}] ${percent}% - ${displayFile.padEnd(40)}`
+				);
+
+				// --config-file is the only flag name yakpro 2.0.14 accepts.
+				// -c causes "Too much parameters" and falls back to defaults.
+				execSync(
+					`"${yakproPath}" "${sourcePath}" -o "${outputFile}" --config-file "${cnf}"`,
+					{
+						stdio: 'pipe',
+						timeout: 60000
+					}
+				);
+
+				// yakpro can exit 0 and still fail to write the file
+				if (!await fs.pathExists(outputFile)) {
+					throw new Error(
+						`yakpro exited successfully but produced no output at ${outputFile}`
 					);
+				}
 
-					const cnfOption = await fs.pathExists(cnf)
-						? ` -c "${cnf}"`
-						: '';
+				processed++;
 
-					execSync(
-						`"${yakproPath}" "${sourcePath}" -o "${outputFile}"${cnfOption}`,
-						{
-							stdio: 'pipe',
-							timeout: 60000
-						}
-					);
-					
-					processed++;
+			} catch (error) {
+				failed++;
+				failedFiles.push({
+					file,
+					error: error.message
+				});
 
-				} catch (error) {
-					failed++;
-					failedFiles.push({
-						file,
-						error: error.message
-					});
-					continue;
+				// Log the first few failures at non-verbose level so silent
+				// mass failure is visible immediately.
+				if (failed <= 5) {
+					this.log(`Failed: ${file}`, false, 'error');
+					this.log(`  ${error.message.split('\n')[0]}`, false, 'error');
 				}
 			}
 		}
 
 		const duration = ((Date.now() - startTime) / 1000).toFixed(2);
 
-		// Clear progress line
+		// Clear the progress line
 		process.stdout.write('\r' + ' '.repeat(80) + '\r');
 
-		// Show obfuscation summary
 		this.log(' ', false, 'space');
-		this.log(`PHP obfuscation completed in ${duration}s`, true, 'info');
-		this.log(`Successfully processed: ${processed}/${total} files`, true, 'success');
+		this.log(`PHP obfuscation completed in ${duration}s`, false, 'info');
+		this.log(`Successfully processed: ${processed}/${total} files`, false,
+			processed === total ? 'success' : 'warn');
 
 		if (failed > 0) {
-			this.log(`Failed: ${failed} files`, true, 'error');
+			this.log(`Failed: ${failed} files`, false, 'error');
+		}
+		
+		if (processed === 0) {
+			throw new Error(
+				'PHP obfuscation produced no output. Aborting before the ' +
+				'archive is built — check the first errors above.'
+			);
 		}
 
-		// REPLACE ORIGINAL FILES WITH OBFUSCATED ONES
-		if (processed > 0) {
-			this.log('\nReplacing original PHP files with obfuscated versions...', false, 'info');
-
-			try {
-				await this.replace_php_files(phpFiles, failedFiles);
-				this.log('PHP files replaced successfully', false, 'info');
-			} catch (error) {
-				this.log(`Failed to replace files: ${error.message}`, true, 'error');
-				this.log('   Obfuscated files are available in the "obfuscated/" directory', true, 'info');
-			}
+		if (failed > 0) {
+			throw new Error(
+				`PHP obfuscation failed for ${failed}/${total} files. ` +
+				'Aborting to avoid shipping partially-obfuscated code.'
+			);
 		}
+		
+		this.log('\nReplacing original PHP files with obfuscated versions...', false, 'info');
 
+		await this.replace_php_files(phpFiles, failedFiles);
+
+		this.log('PHP files replaced successfully', false, 'info');
 		this.log(' ', false, 'space');
 	}
 
@@ -2095,7 +2195,7 @@ class App {
 
 			let client;
 
-			try {
+			try { 
 				if (config.protocol === 'sftp') {
 					client = new SftpClient(); 
 
