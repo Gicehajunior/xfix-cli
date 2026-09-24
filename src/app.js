@@ -1297,19 +1297,16 @@ class App {
 				throw new Error(responseData.message || 'Unknown deployment error');
 			}
 
-		} catch (error) { 
-			console.error('FETCH ERROR:', error);
-			console.error('NAME:', error.name);
-			console.error('MESSAGE:', error.message);
-			console.error('CODE:', error.code);
-			console.error('CAUSE:', error.cause);
+		} catch (error) {
+			console.error('STAGING ERROR:', error);
 
 			if (error.name === 'AbortError') {
-				console.log('STAGING ABORTION EXCEPTION: ', 'Remote deployment staging request timed out after 5 minutes');
-				return;
+				throw new Error('Remote deployment staging timed out after 5 minutes', {
+					cause: error
+				});
 			}
 
-			console.log('STAGING ERROR EXCEPTION: ', error?.message || 'Remote deployment staging request timed out after 5 minutes')
+			throw error;
 		}
 	}
 
@@ -2023,9 +2020,10 @@ class App {
 	 * Main deployment pipeline
 	 */
 	async deploy() {
+		let deployedOk = false;
 		const start_time = Date.now();
 		const config = await this.loadConfig();
-
+		
 		try {
 			this.log('Starting XFIX deployment...', false, 'deploy');
 
@@ -2179,6 +2177,7 @@ class App {
 				);
 
 				await this.uploadWithRetry(client, zip_path, remote_file_path, config);
+				deployedOk = true;
 			} finally {
 				if (client) {
 					if (config.protocol === 'sftp') {
@@ -2191,14 +2190,18 @@ class App {
 				}
 			}
 
+			if (deployedOk) {
+				await this.updateDeployMarker();
+			}
+
 		} catch (error) {
 			const zip_path = path.join(this.ROOT, 'deploy.zip');
-			await this.cleanup(zip_path, config);
-
-			// Revert obfuscation on error
-			await this.cleanupAfterDeployment(false);
-
+			await this.cleanup(zip_path, config);  
 			throw error;
+		}
+		finally {
+			// cleanup after deployment
+			await this.cleanupAfterDeployment(true);
 		}
 	}
 
