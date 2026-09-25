@@ -1221,7 +1221,13 @@ class App {
 				}
 
 				this.log('Upload complete', false, 'success');
-				await this.triggerDeploymentStaging(config.deployUrl, config);
+
+				const staging = await this.triggerDeploymentStaging(config.deployUrl, config);
+				if (staging && staging.status == 'error') {
+					throw new Error(staging.message || 'Unknown staging error');
+				}
+				
+				this.log('Remote deployment staging successful', false, 'info');
 				return;
 			} catch (error) {
 				lastError = error;
@@ -1284,21 +1290,36 @@ class App {
 
 			if (!res.ok) {
 				const errorText = await res.text();
-				throw new Error(`HTTP ${res.status}: ${res.statusText} - ${errorText}`);
+				let payload = null;
+
+				try {
+					payload = JSON.parse(errorText);
+				} catch {
+					// not JSON — fall through to the raw text
+				}
+
+				const message = payload?.message
+					? payload.message
+					: errorText || res.statusText;
+
+				const err = new Error(message);
+				err.status = res.status;
+				err.statusText = res.statusText;
+				err.code = payload?.code ?? res.status;
+				err.response = payload;
+
+				throw err;
 			}
 
-			const responseData = await res.json();
-
-			if (responseData.success) {
-				this.log('Remote deployment staging triggered successfully', false, 'info');
-				this.log(`Files deployed: ${this.options.included || 'N/A'}`, false, 'info');
-				this.log(`Version: ${config?.version || 'N/A'}`, false, 'info');
-			} else {
+			const responseData = await res.json(); 
+			if (responseData.status == 'error') { 
 				throw new Error(responseData.message || 'Unknown deployment error');
 			}
 
+			return responseData;
+
 		} catch (error) {
-			console.error('STAGING ERROR:', error);
+			this.log(`Staging error: ${error?.message || '<no message>'}`, true, 'error');
 
 			if (error.name === 'AbortError') {
 				throw new Error('Remote deployment staging timed out after 5 minutes', {
@@ -1306,10 +1327,22 @@ class App {
 				});
 			}
 
+			if (error?.code <= 499) {
+				throw new Error(`Client error during remote deployment staging: ${error?.message || '<no message>'}`, {
+					cause: error
+				});
+			}
+
+			if (error?.code >= 500) {
+				throw new Error(`Server error during remote deployment staging: ${error?.message || '<no message>'}`, {
+					cause: error
+				});
+			}
+
 			throw error;
 		}
 	}
-
+	
 	async cleanup(zipPath, config) {
 		if (config.cleanupLocal && await fs.pathExists(zipPath)) {
 			await fs.remove(zipPath);
