@@ -6,9 +6,9 @@ import archiver from 'archiver';
 import ftp from 'basic-ftp';
 import SftpClient from 'ssh2-sftp-client';
 import fetch from 'node-fetch';
-import { execa } from 'execa'; 
+import { execa } from 'execa';
 import { fileURLToPath } from 'url';
-import { execSync } from 'child_process'; 
+import { execSync } from 'child_process';
 import JavaScriptObfuscator from 'javascript-obfuscator';
 import { promisify } from 'util';
 import { glob } from 'glob';
@@ -17,9 +17,10 @@ import dns from "node:dns/promises";
 import https from 'https';
 import fg from 'fast-glob';
 import mysql from 'mysql2/promise';
-import pg from 'pg'; 
+import pg from 'pg';
 import sqlite3 from 'sqlite3';
 import { open } from 'sqlite';
+import os from 'node:os';
 
 class App {
     constructor(options = {}) {
@@ -30,11 +31,11 @@ class App {
         this.globPromise = promisify(glob);
 
         this.git = simpleGit(this.ROOT);
-        
+
         // Support per-distribution last deploy files
         this.distributionName = options.distributionName || 'default';
         this.LAST_DEPLOY_FILE = path.join(
-            this.ROOT, 
+            this.ROOT,
             `.last-deploy-${this.distributionName}`
         );
 
@@ -86,10 +87,6 @@ class App {
 
 	/**
 	 * Logging helper for consistent verbose output
-	 * 
-	 * @param {string} message - The message to log
-	 * @param {boolean} isVerbose - Whether this is a verbose-only message
-	 * @param {string} type - Message type for icon prefix (info, success, error, warn, skip, progress, deploy, lock, archive, upload, db, git, clean, revert, template, controller, service)
 	 */
 	log(message, isVerbose = false, type = 'info') {
 		if (!isVerbose || (isVerbose && this.config?.verbose)) {
@@ -123,11 +120,10 @@ class App {
 				js: '📜',
 				php: '🐘'
 			};
-			
-			        
+
 			const icon = icons[type] || '';
 			const trimmedMessage = message.trim();
-			
+
 			if (icon) {
 				console.log(` ${icon} ${trimmedMessage}`);
 			} else {
@@ -136,10 +132,10 @@ class App {
 		}
 	}
 
-	/** 
+	/**
 	 * CONFIGURATION METHODS
 	*/
-	async loadConfig() { 
+	async loadConfig() {
 		const config = this.options;
 
 		this.config = {
@@ -157,7 +153,7 @@ class App {
 			rejectUnauthorized: config.rejectUnauthorized || false,
 			maxRetries: config.maxRetries || 3,
 			retryDelay: config.retryDelay || 2000,
-			ftpTimeout: config.ftpTimeout || 0, // 120 s
+			ftpTimeout: config.ftpTimeout || 0,
 			allowBackup: config.allowBackup || false,
 			cleanupLocal: config.cleanupLocal || false,
 			runMigrations: config.runMigrations || false,
@@ -210,7 +206,7 @@ class App {
 		return this.config;
 	}
 
-	validateConfig(config) { 
+	validateConfig(config) {
 		const required = ['host', 'username', 'password', 'remotePath', 'deployPath'];
 		const missing = required.filter(key => !config[key]);
 
@@ -227,10 +223,1029 @@ class App {
 		}
 	}
 
-	/** 
+	/* ============================================================
+	 * BUILD & SIGNING METHODS
+	 * ============================================================ */
+
+	/**
+	 * Find a binary on PATH, returns absolute path or null
+	 */
+	async findTool(name) {
+		const cmd = process.platform === 'win32' ? 'where.exe' : 'which';
+		try {
+			const out = execSync(`${cmd} ${name}`, { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
+			const first = out.split(/\r?\n/).map(l => l.trim()).filter(Boolean)[0];
+			return first || null;
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * Locate an Android build-tool binary (zipalign, apksigner, ...)
+	 */
+	async findAndroidBuildTool(name) {
+		const onPath = await this.findTool(name);
+		if (onPath) return onPath;
+
+		const sdkRoot = process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT;
+		if (!sdkRoot) return null;
+
+		const buildToolsDir = path.join(sdkRoot, 'build-tools');
+		if (!await fs.pathExists(buildToolsDir)) return null;
+
+		const versions = (await fs.readdir(buildToolsDir)).sort((a, b) =>
+			a.localeCompare(b, undefined, { numeric: true })
+		).reverse();
+
+		const isWin = process.platform === 'win32';
+		for (const v of versions) {
+			for (const ext of isWin ? ['.bat', '.cmd', '.exe', ''] : ['']) {
+				const candidate = path.join(buildToolsDir, v, `${name}${ext}`);
+				if (await fs.pathExists(candidate)) return candidate;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Report which build tools are available
+	 */
+	async checkBuildTools() {
+		const names = ['flutter', 'keytool', 'jarsigner', 'zipalign', 'apksigner'];
+		const results = {};
+		for (const n of names) {
+			results[n] = await this.findAndroidBuildTool(n);
+		}
+		return results;
+	}
+
+	/**
+	 * Read the raw .xfixrc.json (no merging, no dns lookups)
+	 */
+	async getRawConfig() {
+		const p = path.join(this.ROOT, '.xfixrc.json');
+		if (!await fs.pathExists(p)) return {};
+		try {
+			return await fs.readJson(p);
+		} catch {
+			return {};
+		}
+	}
+
+	/**
+	 * Resolve android config: env > .xfixrc.json > defaults
+	 */
+	async getAndroidConfig() {
+		const raw = await this.getRawConfig();
+		const a = raw.android || {};
+		return {
+			appId: process.env.XFIX_APP_ID || a.appId || null,
+			keystorePath: process.env.ANDROID_KEYSTORE_PATH || a.keystorePath || 'android/app/release.jks',
+			keystorePassword: process.env.ANDROID_KEYSTORE_PASSWORD || a.keystorePassword || '',
+			keyAlias: process.env.ANDROID_KEY_ALIAS || a.keyAlias || 'release',
+			keyPassword: process.env.ANDROID_KEY_PASSWORD || a.keyPassword || '',
+			projectDir: a.projectDir || '.',
+			buildType: a.buildType || 'release',
+			credentialsApi: a.credentialsApi || null
+		};
+	}
+
+	/* ------------------------------------------------------------
+	 * Signing credentials: env override → credentials API → config
+	 * ---------------------------------------------------------- */
+
+	/**
+	 * Build request headers from the config's auth block.
+	 *
+	 * Supported shapes (all optional, combinable):
+	 *   "auth": { "type": "bearer",  "tokenEnv": "XFIX_SECRETS_TOKEN" }
+	 *   "auth": { "type": "basic",   "userEnv": "U", "passEnv": "P" }
+	 *   "auth": { "type": "header",  "headerName": "X-API-Key", "tokenEnv": "K" }
+	 *   "auth": {
+	 *     "headers": {
+	 *       "XFIX-APP-ID":  { "env": "XFIX_APP_ID" },
+	 *       "XFIX-API-KEY": { "env": "XFIX_API_KEY" },
+	 *       "X-Tenant":     "acme",
+	 *       "Authorization": { "template": "Token ${XFIX_API_KEY}" }
+	 *     }
+	 *   }
+	 */
+	_resolveAuthHeaders(auth) {
+		const out = {};
+		if (!auth) return out;
+
+		if (auth.type === 'bearer') {
+			const token = auth.tokenEnv ? process.env[auth.tokenEnv] : null;
+			if (!token) {
+				throw new Error(
+					`Credentials API uses bearer auth but env var ${auth.tokenEnv} is not set`
+				);
+			}
+			out['Authorization'] = `Bearer ${token}`;
+		}
+
+		if (auth.type === 'basic') {
+			const user = auth.userEnv ? process.env[auth.userEnv] : null;
+			const pass = auth.passEnv ? process.env[auth.passEnv] : null;
+			if (!user) throw new Error(`Missing env var ${auth.userEnv} for basic auth`);
+			if (!pass) throw new Error(`Missing env var ${auth.passEnv} for basic auth`);
+			out['Authorization'] =
+				`Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`;
+		}
+
+		if (auth.type === 'header') {
+			const token = auth.tokenEnv ? process.env[auth.tokenEnv] : null;
+			if (!token) {
+				throw new Error(
+					`Credentials API uses header auth but env var ${auth.tokenEnv} is not set`
+				);
+			}
+			out[auth.headerName || 'X-API-Key'] = token;
+		}
+
+		if (auth.headers && typeof auth.headers === 'object') {
+			for (const [name, spec] of Object.entries(auth.headers)) {
+				out[name] = this._resolveHeaderValue(name, spec);
+			}
+		}
+
+		return out;
+	}
+
+	/**
+	 * Resolve a single header value from a literal string, { env }, or { template }.
+	 */
+	_resolveHeaderValue(name, spec) {
+		if (typeof spec === 'string') return spec;
+
+		if (typeof spec !== 'object' || spec === null) {
+			throw new Error(
+				`Header "${name}" must be a string, { env }, or { template }`
+			);
+		}
+
+		if (spec.env) {
+			const v = process.env[spec.env];
+			if (v === undefined || v === '') {
+				throw new Error(
+					`Header "${name}" requires env var "${spec.env}" which is not set`
+				);
+			}
+			return v;
+		}
+
+		if (spec.template) {
+			return spec.template.replace(/\$\{([A-Z0-9_]+)\}/gi, (_, varName) => {
+				const v = process.env[varName];
+				if (v === undefined || v === '') {
+					throw new Error(
+						`Header "${name}" template references env var "${varName}" which is not set`
+					);
+				}
+				return v;
+			});
+		}
+
+		throw new Error(
+			`Header "${name}" must specify either { env } or { template }`
+		);
+	}
+
+	/**
+	 * Fetch credentials from the configured company API.
+	 * Caches per App instance.
+	 */
+	async fetchSigningCredentials() {
+		if (this._signingCredentials !== undefined) return this._signingCredentials;
+
+		const cfg = await this.getAndroidConfig();
+		const api = cfg.credentialsApi;
+
+		if (!api || !api.url) {
+			this._signingCredentials = null;
+			return null;
+		}
+
+		const timeout = api.timeout || 10000;
+		const retries = api.retries ?? 2;
+
+		const headers = {
+			'Content-Type': 'application/json',
+			'Accept': 'application/json',
+			'User-Agent': 'XFIX-Signing/1.0'
+		};
+
+		Object.assign(headers, this._resolveAuthHeaders(api.auth));
+
+		let lastError;
+
+		for (let attempt = 1; attempt <= retries + 1; attempt++) {
+			const controller = new AbortController();
+			const timer = setTimeout(() => controller.abort(), timeout);
+
+			try {
+				this.log(
+					`Fetching signing credentials from API (attempt ${attempt}/${retries + 1})...`,
+					true,
+					'info'
+				);
+
+				const res = await fetch(api.url, {
+					method: api.method || 'POST',
+					headers,
+					signal: controller.signal,
+					body: (api.method || 'POST').toUpperCase() === 'GET'
+						? undefined
+						: JSON.stringify(api.body || {})
+				});
+
+				clearTimeout(timer);
+
+				if (!res.ok) {
+					const text = await res.text().catch(() => '');
+					throw new Error(
+						`Credentials API returned ${res.status} ${res.statusText}` +
+						(text ? ` (${text.slice(0, 200)})` : '')
+					);
+				}
+
+				const data = await res.json();
+
+				// Honour an explicit failure envelope even if HTTP status was 2xx
+				const failed =
+					data.success === false ||
+					data.status === 'error' ||
+					data.status === 'failed';
+
+				if (failed) {
+					const msg = data.message || data.error || 'unknown error';
+					throw new Error(`Credentials API reported failure: ${msg}`);
+				}
+
+				const creds = data.credentials || data;
+
+				if (!creds.keystorePassword) {
+					throw new Error(
+						'Credentials API response is missing "keystorePassword"'
+					);
+				}
+
+				this._signingCredentials = {
+					storePassword: creds.keystorePassword,
+					keyPassword: creds.keyPassword || creds.keystorePassword,
+					keyAlias: creds.keyAlias || null,
+					packageName: creds.packageName || null,
+					keystoreBase64: creds.keystoreBase64 || null
+				};
+
+				this.log('Signing credentials fetched', false, 'success');
+				return this._signingCredentials;
+
+			} catch (error) {
+				clearTimeout(timer);
+				lastError = error.name === 'AbortError'
+					? new Error(`Credentials API timed out after ${timeout}ms`)
+					: error;
+
+				if (attempt <= retries) {
+					const backoff = 500 * attempt;
+					this.log(`  Attempt ${attempt} failed: ${lastError.message}`, true, 'warn');
+					this.log(`  Retrying in ${backoff}ms...`, true, 'warn');
+					await new Promise(r => setTimeout(r, backoff));
+				}
+			}
+		}
+
+		throw new Error(
+			`Failed to fetch signing credentials after ${retries + 1} attempts: ${lastError.message}\n` +
+			`   • Set ANDROID_KEYSTORE_PASSWORD env var to skip the API`
+		);
+	}
+
+	/**
+	 * Priority: env var → credentials API → literal config. Returns null if none.
+	 */
+	async resolveSigningCredentials(overrides = {}) {
+		const cfg = await this.getAndroidConfig();
+
+		if (process.env.ANDROID_KEYSTORE_PASSWORD) {
+			return {
+				storePassword: process.env.ANDROID_KEYSTORE_PASSWORD,
+				keyPassword: process.env.ANDROID_KEY_PASSWORD || process.env.ANDROID_KEYSTORE_PASSWORD,
+				keyAlias: overrides.keyAlias || process.env.ANDROID_KEY_ALIAS || cfg.keyAlias,
+				packageName: null,
+				keystoreBase64: null,
+				source: 'env'
+			};
+		}
+
+		const fromApi = await this.fetchSigningCredentials();
+		if (fromApi) {
+			return {
+				...fromApi,
+				keyAlias: overrides.keyAlias || fromApi.keyAlias || cfg.keyAlias,
+				source: 'api'
+			};
+		}
+
+		if (cfg.keystorePassword) {
+			return {
+				storePassword: cfg.keystorePassword,
+				keyPassword: cfg.keyPassword || cfg.keystorePassword,
+				keyAlias: overrides.keyAlias || cfg.keyAlias,
+				packageName: null,
+				keystoreBase64: null,
+				source: 'config'
+			};
+		}
+
+		return null;
+	}
+
+	/**
+	 * Write a base64-encoded keystore to a temp file. Returns { path, cleanupDir }.
+	 */
+	async materializeKeystore(base64) {
+		if (!base64) return null;
+
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'xfix-ks-'));
+		const ksPath = path.join(tmpDir, 'release.jks');
+		await fs.writeFile(ksPath, Buffer.from(base64, 'base64'));
+
+		this.log('Materialised API-provided keystore to temp file', true, 'info');
+
+		return { path: ksPath, cleanupDir: tmpDir };
+	}
+	
+	/**
+	 * Phase 1 of provisioning — ask the server what DN / alias / package
+	 * name to use for a new keystore for this application.
+	 *
+	 * POST {provisioningApi.url}/prepare
+	 */
+	async prepareSigningProvision({ appId, apiUrl }) {
+		const raw = await this.getRawConfig();
+		const cfg = raw.android?.provisioningApi || {};
+
+		const baseUrl = apiUrl || cfg.url;
+		if (!baseUrl) {
+			throw new Error(
+				'No provisioning API configured.\n' +
+				'   Set android.provisioningApi.url in .xfixrc.json\n' +
+				'   or pass --api-url <url>'
+			);
+		}
+
+		const url = baseUrl.replace(/\/+$/, '') + '/prepare';
+
+		const headers = {
+			'Content-Type': 'application/json',
+			'Accept': 'application/json',
+			'User-Agent': 'XFIX-Provision/1.0'
+		};
+
+		// Config-supplied auth first, then the --app-id flag wins
+		const auth = cfg.auth || raw.android?.credentialsApi?.auth;
+		Object.assign(headers, this._resolveAuthHeaders(auth));
+		headers['XFIX-APP-ID'] = appId;
+
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), cfg.timeout || 10000);
+
+		let res;
+		try {
+			res = await fetch(url, {
+				method: 'POST',
+				headers,
+				signal: controller.signal,
+				body: JSON.stringify({})
+			});
+		} catch (error) {
+			clearTimeout(timer);
+			if (error.name === 'AbortError') {
+				throw new Error(`Provisioning prepare timed out after ${cfg.timeout || 10000}ms`);
+			}
+			throw error;
+		}
+		clearTimeout(timer);
+
+		if (!res.ok) {
+			const text = await res.text().catch(() => '');
+			throw new Error(
+				`Provisioning prepare failed: ${res.status} ${res.statusText}` +
+				(text ? ` (${text.slice(0, 300)})` : '')
+			);
+		}
+
+		const data = await res.json();
+
+		if (data.success === false || data.status === 'error' || data.status === 'failed') {
+			throw new Error(
+				`Prepare failed: ${data.message || data.error || 'unknown error'}`
+			);
+		}
+
+		const p = data.provisioning || data;
+
+		if (!p.dname) {
+			throw new Error('Provisioning prepare response is missing "dname"');
+		}
+
+		this.log(
+			`Prepared provisioning for ${appId} (DN from server)`,
+			true,
+			'info'
+		);
+
+		return {
+			dname: p.dname,
+			keyAlias: p.keyAlias || 'release',
+			packageName: p.packageName || null,
+			suggestedFilename: p.suggestedFilename || null,
+			passwordOwner: p.passwordOwner || 'client',
+			keystorePassword: p.keystorePassword || null
+		};
+	}
+
+	/**
+	 * Phase 2 of provisioning — upload the generated keystore to the server.
+	 *
+	 * POST {provisioningApi.url}/commit
+	 */
+	async commitSigningProvision({ appId, keystoreBase64, keystorePassword, keyAlias, packageName, apiUrl }) {
+		const raw = await this.getRawConfig();
+		const cfg = raw.android?.provisioningApi || {};
+
+		const baseUrl = apiUrl || cfg.url;
+		if (!baseUrl) {
+			throw new Error('No provisioning API configured.');
+		}
+
+		const url = baseUrl.replace(/\/+$/, '') + '/commit';
+
+		const headers = {
+			'Content-Type': 'application/json',
+			'Accept': 'application/json',
+			'User-Agent': 'XFIX-Provision/1.0'
+		};
+
+		const auth = cfg.auth || raw.android?.credentialsApi?.auth;
+		Object.assign(headers, this._resolveAuthHeaders(auth));
+		headers['XFIX-APP-ID'] = appId;
+
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), cfg.timeout || 30000);
+
+		let res;
+		try {
+			res = await fetch(url, {
+				method: 'POST',
+				headers,
+				signal: controller.signal,
+				body: JSON.stringify({
+					keystoreBase64,
+					keystorePassword,
+					keyAlias,
+					packageName: packageName || null
+				})
+			});
+		} catch (error) {
+			clearTimeout(timer);
+			if (error.name === 'AbortError') {
+				throw new Error(`Provisioning commit timed out after ${cfg.timeout || 30000}ms`);
+			}
+			throw error;
+		}
+		clearTimeout(timer);
+
+		if (!res.ok) {
+			const text = await res.text().catch(() => '');
+			throw new Error(
+				`Provisioning commit failed: ${res.status} ${res.statusText}` +
+				(text ? ` (${text.slice(0, 300)})` : '')
+			);
+		}
+
+		const data = await res.json();
+
+		if (data.success === false || data.status === 'error' || data.status === 'failed') {
+			throw new Error(
+				`Commit failed: ${data.message || data.error || 'unknown error'}`
+			);
+		}
+
+		this.log(`Keystore registered on server for ${appId}`, false, 'success');
+
+		return {
+			appId,
+			keystorePath: data.keystorePath || null,
+			raw: data
+		};
+	}
+
+	/**
+	 * Upload a generated keystore to the XFIX server for a specific application.
+	 * The server stores the file, encrypts the passwords, and updates the app row.
+	 *
+	 * Expected endpoint contract:
+	 *   POST {apiUrl}
+	 *   Headers: XFIX-APP-ID, XFIX-API-KEY (or whatever auth.provisioningApi uses)
+	 *   Body: {
+	 *     keystoreBase64, keystorePassword, keyAlias, packageName
+	 *   }
+	 *   Response: { success: true, keystorePath: "..." }
+	 */
+	async provisionSigningCredentials({ appId, keystoreBase64, keystorePassword, keyAlias, packageName, apiUrl }) {
+		const raw = await this.getRawConfig();
+		const cfg = raw.android?.provisioningApi || {};
+
+		const url = apiUrl || cfg.url;
+		if (!url) {
+			throw new Error(
+				'No provisioning API configured.\n' +
+				'   Set android.provisioningApi.url in .xfixrc.json\n' +
+				'   or pass --api-url <url>'
+			);
+		}
+
+		// Build headers — reuse the same auth resolution as the fetch API
+		const headers = {
+			'Content-Type': 'application/json',
+			'Accept': 'application/json',
+			'User-Agent': 'XFIX-Provision/1.0'
+		};
+
+		// If no explicit headers in provisioningApi, fall back to credentialsApi auth
+		const auth = cfg.auth || raw.android?.credentialsApi?.auth;
+		Object.assign(headers, this._resolveAuthHeaders(auth));
+
+		// XFIX-APP-ID header tells the server which app this keystore is for
+		headers['XFIX-APP-ID'] = appId;
+
+		const res = await fetch(url, {
+			method: 'POST',
+			headers,
+			body: JSON.stringify({
+				keystoreBase64,
+				keystorePassword,
+				keyAlias,
+				packageName: packageName || null
+			})
+		});
+
+		if (!res.ok) {
+			const text = await res.text().catch(() => '');
+			throw new Error(
+				`Provisioning API returned ${res.status} ${res.statusText}` +
+				(text ? ` (${text.slice(0, 300)})` : '')
+			);
+		}
+
+		const data = await res.json();
+
+		if (data.success === false || data.status === 'error') {
+			throw new Error(
+				`Provisioning failed: ${data.message || data.error || 'unknown error'}`
+			);
+		}
+
+		return {
+			appId,
+			keystorePath: data.keystorePath || data.path || null,
+			raw: data
+		};
+	}
+	
+	/**
+	 * Generate a new JKS keystore via keytool.
+	 *
+	 * Output is captured rather than inherited so keytool's raw stderr
+	 * (Java stack traces, "Command failed: ..." lines) never leaks to the
+	 * terminal. Errors are normalised into single-line messages.
+	 */
+	async generateKeystore(opts) {
+		const keytool = await this.findTool('keytool');
+		if (!keytool) {
+			throw new Error('keytool not found. Install a JDK 11+ and ensure keytool is on PATH.');
+		}
+
+		if (!opts.storepass) {
+			throw new Error('Keystore password is required');
+		}
+
+		// keytool's own minimum. Validate here so we never shell out and
+		// never see the Java stack trace.
+		if (opts.storepass.length < 6) {
+			throw new Error(
+				'Keystore password must be at least 6 characters (keytool requirement).\n' +
+				`   Provided length: ${opts.storepass.length}\n` +
+				'   The platform administrator must set a longer password\n' +
+				'   on the app row (android_keystore_password) before provisioning.'
+			);
+		}
+
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'xfix-ks-'));
+		const passFile = path.join(tmpDir, 'pass.txt');
+		await fs.writeFile(passFile, opts.storepass + '\n');
+
+		try {
+			// Note: no `-v`. It adds noise we don't need.
+			const args = [
+				'-genkeypair',
+				'-keystore', opts.path,
+				'-alias', opts.alias,
+				'-keyalg', opts.keyalg || 'RSA',
+				'-keysize', String(opts.keysize || 2048),
+				'-validity', String(opts.validity || 10000),
+				'-storetype', 'JKS',
+				'-storepass:file', passFile,
+				'-keypass:file', passFile,
+				'-dname', opts.dname || 'CN=Unknown, OU=Unknown, O=Unknown, L=Unknown, ST=Unknown, C=Unknown'
+			];
+
+			try {
+				execSync(
+					`"${keytool}" ${args.map(a => `"${a}"`).join(' ')}`,
+					{
+						encoding: 'utf-8',
+						stdio: ['ignore', 'pipe', 'pipe']   // ← was 'inherit'
+					}
+				);
+			} catch (execError) {
+				// Strip everything except the meaningful keytool error line
+				const raw = (execError.stderr || execError.stdout || '').toString();
+
+				const match = raw.match(/keytool error:\s*(.+)/);
+				const detail = match ? match[1].trim() : null;
+
+				// Known failure modes → helpful hints
+				if (detail && /at least 6 characters/i.test(detail)) {
+					throw new Error(
+						'keytool rejected the password: must be at least 6 characters.\n' +
+						'   The platform administrator must set a longer value\n' +
+						'   on the app row (android_keystore_password).'
+					);
+				}
+
+				if (detail && /already exists|already been imported/i.test(detail)) {
+					throw new Error(
+						`Keystore already exists at ${opts.path}\n` +
+						'   Pass --force to overwrite, or delete the file first.'
+					);
+				}
+
+				if (detail && /alias.*already exists/i.test(detail)) {
+					throw new Error(
+						`Alias "${opts.alias}" already exists in the keystore.\n` +
+						'   Use a different --alias, or delete the keystore first.'
+					);
+				}
+
+				if (detail) {
+					throw new Error(`keytool failed: ${detail}`);
+				}
+
+				// Fallback — no "keytool error:" line at all
+				throw new Error(
+					'keytool failed for an unknown reason.\n' +
+					'   Re-run with --verbose and check the JDK installation.'
+				);
+			}
+		} finally {
+			await fs.remove(tmpDir).catch(() => {});
+		}
+	}
+
+	/**
+	 * Show keystore info via keytool -list
+	 */
+	async showKeystoreInfo(opts) {
+		const cfg = await this.getAndroidConfig();
+		const keystorePath = opts.path || cfg.keystorePath;
+		const storepass = opts.storepass || cfg.keystorePassword;
+
+		if (!keystorePath || !await fs.pathExists(keystorePath)) {
+			throw new Error(`Keystore not found: ${keystorePath}`);
+		}
+		if (!storepass) throw new Error('Keystore password required');
+
+		const keytool = await this.findTool('keytool');
+		if (!keytool) throw new Error('keytool not found');
+
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'xfix-ks-'));
+		const passFile = path.join(tmpDir, 'pass.txt');
+		await fs.writeFile(passFile, storepass + '\n');
+
+		try {
+			execSync(
+				`"${keytool}" -list -v -keystore "${keystorePath}" -storepass:file "${passFile}"`,
+				{ stdio: 'inherit' }
+			);
+		} finally {
+			await fs.remove(tmpDir).catch(() => {});
+		}
+	}
+
+	/**
+	 * Sign an APK: zipalign + apksigner (v1/v2/v3)
+	 */
+	async signApk(apkPath, options = {}) {
+		const cfg = await this.getAndroidConfig();
+
+		const resolved = await this.resolveSigningCredentials({
+			keyAlias: options.keyAlias
+		});
+
+		if (!resolved) {
+			throw new Error(
+				'No signing credentials available.\n' +
+				'   Provide one of:\n' +
+				'   • ANDROID_KEYSTORE_PASSWORD env var\n' +
+				'   • android.credentialsApi in .xfixrc.json\n' +
+				'   • android.keystorePassword in .xfixrc.json (dev only)'
+			);
+		}
+
+		let keystorePath = options.keystorePath || cfg.keystorePath;
+		let tempKeystore = null;
+
+		if (resolved.keystoreBase64) {
+			tempKeystore = await this.materializeKeystore(resolved.keystoreBase64);
+			keystorePath = tempKeystore.path;
+		}
+
+		const storePassword = resolved.storePassword;
+		const keyAlias      = resolved.keyAlias || cfg.keyAlias;
+		const keyPassword   = resolved.keyPassword || storePassword;
+
+		try {
+			if (!keystorePath || !await fs.pathExists(keystorePath)) {
+				const hint = resolved.source === 'api'
+					? '   • The API returned keystoreBase64: null (server has no .jks)\n' +
+					  '   • AND no local keystore exists at the configured path\n' +
+					  '   • For local dev: place the .jks at the path above\n' +
+					  '   • For CI: fix the server so it returns keystoreBase64'
+					: '   • Set android.keystorePath or ANDROID_KEYSTORE_PATH';
+
+				throw new Error(`Keystore not found: ${keystorePath}\n${hint}`);
+			}
+
+			const zipalign  = await this.findAndroidBuildTool('zipalign');
+			const apksigner = await this.findAndroidBuildTool('apksigner');
+
+			if (!zipalign)  throw new Error('zipalign not found. Install Android build-tools and set ANDROID_HOME.');
+			if (!apksigner) throw new Error('apksigner not found. Install Android build-tools and set ANDROID_HOME.');
+
+			this.log(`  Credentials source: ${resolved.source}`, true, 'info');
+
+			const aligned = apkPath.replace(/\.apk$/i, '') + '-aligned.apk';
+
+			this.log('  zipalign...', true, 'info');
+			execSync(`"${zipalign}" -f -p 4 "${apkPath}" "${aligned}"`, { stdio: 'inherit' });
+
+			this.log('  apksigner...', true, 'info');
+
+			const env = { ...process.env };
+			env.XFIX_KS_PASS  = storePassword;
+			env.XFIX_KEY_PASS = keyPassword;
+
+			const args = [
+				'sign',
+				'--ks', keystorePath,
+				'--ks-key-alias', keyAlias,
+				'--ks-pass',  'env:XFIX_KS_PASS',
+				'--key-pass', 'env:XFIX_KEY_PASS',
+				'--v1-signing-enabled', 'true',
+				'--v2-signing-enabled', 'true',
+				'--v3-signing-enabled', 'true',
+				aligned
+			];
+
+			execSync(`"${apksigner}" ${args.map(a => `"${a}"`).join(' ')}`, {
+				stdio: 'inherit',
+				env
+			});
+
+			await fs.move(aligned, apkPath, { overwrite: true });
+			this.log(`  Signed: ${path.relative(this.ROOT, apkPath)}`, false, 'success');
+			return apkPath;
+
+		} finally {
+			if (tempKeystore) {
+				await fs.remove(tempKeystore.cleanupDir).catch(() => {});
+			}
+		}
+	}
+
+	/**
+	 * Sign an AAB (jarsigner-style signing)
+	 */
+	async signAab(aabPath, options = {}) {
+		const cfg = await this.getAndroidConfig();
+
+		const resolved = await this.resolveSigningCredentials({
+			keyAlias: options.keyAlias
+		});
+
+		if (!resolved) {
+			throw new Error(
+				'No signing credentials available.\n' +
+				'   Set ANDROID_KEYSTORE_PASSWORD or configure android.credentialsApi.'
+			);
+		}
+
+		let keystorePath = options.keystorePath || cfg.keystorePath;
+		let tempKeystore = null;
+
+		if (resolved.keystoreBase64) {
+			tempKeystore = await this.materializeKeystore(resolved.keystoreBase64);
+			keystorePath = tempKeystore.path;
+		}
+
+		const storePassword = resolved.storePassword;
+		const keyAlias      = resolved.keyAlias || cfg.keyAlias;
+		const keyPassword   = resolved.keyPassword || storePassword;
+
+		try {
+			if (!keystorePath || !await fs.pathExists(keystorePath)) {
+				throw new Error(`Keystore not found: ${keystorePath}`);
+			}
+
+			const jarsigner = await this.findTool('jarsigner');
+			if (!jarsigner) throw new Error('jarsigner not found. Install a JDK 11+.');
+
+			this.log(`  Credentials source: ${resolved.source}`, true, 'info');
+
+			const tmpDir    = await fs.mkdtemp(path.join(os.tmpdir(), 'xfix-jar-'));
+			const storeFile = path.join(tmpDir, 'store.txt');
+			const keyFile   = path.join(tmpDir, 'key.txt');
+			await fs.writeFile(storeFile, storePassword + '\n');
+			await fs.writeFile(keyFile,   keyPassword   + '\n');
+
+			try {
+				const args = [
+					'-keystore', keystorePath,
+					'-storepass:file', storeFile,
+					'-keypass:file',   keyFile,
+					'-sigalg', 'SHA256withRSA',
+					'-digestalg', 'SHA-256',
+					aabPath,
+					keyAlias
+				];
+
+				execSync(`"${jarsigner}" ${args.map(a => `"${a}"`).join(' ')}`, {
+					stdio: 'inherit'
+				});
+			} finally {
+				await fs.remove(tmpDir).catch(() => {});
+			}
+
+			this.log(`  Signed: ${path.relative(this.ROOT, aabPath)}`, false, 'success');
+			return aabPath;
+
+		} finally {
+			if (tempKeystore) {
+				await fs.remove(tempKeystore.cleanupDir).catch(() => {});
+			}
+		}
+	}
+
+	/**
+	 * Verify an APK signature via apksigner
+	 */
+	async verifyApk(apkPath) {
+		const apksigner = await this.findAndroidBuildTool('apksigner');
+		if (!apksigner) {
+			throw new Error('apksigner not found. Install Android build-tools and set ANDROID_HOME.');
+		}
+		if (!await fs.pathExists(apkPath)) {
+			throw new Error(`APK not found: ${apkPath}`);
+		}
+
+		this.log(`Verifying: ${path.relative(this.ROOT, apkPath)}`, false, 'info');
+		try {
+			execSync(`"${apksigner}" verify --verbose --print-certs "${apkPath}"`, {
+				stdio: 'inherit'
+			});
+			this.log('Signature valid', false, 'success');
+			return true;
+		} catch (e) {
+			this.log('Signature INVALID', false, 'error');
+			return false;
+		}
+	}
+
+	/**
+	 * Low-level Flutter runner
+	 */
+	async runFlutter(args) {
+		const flutter = await this.findTool('flutter');
+		if (!flutter) {
+			throw new Error(
+				'flutter not found on PATH.\n' +
+				'   Install: https://docs.flutter.dev/get-started/install'
+			);
+		}
+		const printable = `flutter ${args.join(' ')}`;
+		this.log(`$ ${printable}`, false, 'info');
+
+		try {
+			execSync(`"${flutter}" ${args.map(a => `"${a}"`).join(' ')}`, {
+				stdio: 'inherit',
+				cwd: this.ROOT,
+				env: process.env
+			});
+		} catch (e) {
+			throw new Error(`Flutter command failed: ${printable}`);
+		}
+	}
+
+	/**
+	 * Locate APK files produced by a Flutter build
+	 */
+	async findFlutterApks(flavor) {
+		const dir = path.join(this.ROOT, 'build', 'app', 'outputs', 'flutter-apk');
+		if (!await fs.pathExists(dir)) return [];
+
+		const entries = await fs.readdir(dir);
+		const prefix = flavor ? `app-${flavor}-` : 'app-';
+
+		return entries
+			.filter(f => f.startsWith(prefix) && f.endsWith('.apk'))
+			.map(f => path.join(dir, f));
+	}
+
+	/**
+	 * Locate the AAB produced by a Flutter build
+	 */
+	async findFlutterAab(flavor) {
+		const dir = path.join(this.ROOT, 'build', 'app', 'outputs', 'bundle');
+		if (!await fs.pathExists(dir)) return null;
+
+		const entries = await fs.readdir(dir);
+		const prefix = flavor ? `${flavor}Release` : 'release';
+
+		const match = entries.find(f =>
+			f.toLowerCase() === `${prefix.toLowerCase()}.aab` ||
+			(f.startsWith(prefix) && f.endsWith('.aab'))
+		);
+		return match ? path.join(dir, match) : null;
+	}
+
+	/**
+	 * Build a Flutter APK
+	 */
+	async buildFlutterApk(opts = {}) {
+		const args = ['build', 'apk', '--release'];
+		if (opts.target)      args.push('--target', opts.target);
+		if (opts.flavor)      args.push('--flavor', opts.flavor);
+		if (opts.splitPerAbi) args.push('--split-per-abi');
+		if (opts.verbose)     args.push('-v');
+
+		await this.runFlutter(args);
+		return this.findFlutterApks(opts.flavor);
+	}
+
+	/**
+	 * Build a Flutter AAB
+	 */
+	async buildFlutterAab(opts = {}) {
+		const args = ['build', 'appbundle', '--release'];
+		if (opts.target)  args.push('--target', opts.target);
+		if (opts.flavor)  args.push('--flavor', opts.flavor);
+		if (opts.verbose) args.push('-v');
+
+		await this.runFlutter(args);
+		return this.findFlutterAab(opts.flavor);
+	}
+
+	/**
+	 * Build a Flutter iOS archive
+	 */
+	async buildFlutterIos(opts = {}) {
+		const args = ['build', 'ipa', '--release'];
+		if (opts.target)            args.push('--target', opts.target);
+		if (opts.flavor)            args.push('--flavor', opts.flavor);
+		if (opts.codesign === false) args.push('--no-codesign');
+		if (opts.verbose)           args.push('-v');
+
+		await this.runFlutter(args);
+	}
+
+	/**
+	 * Build a Flutter web bundle
+	 */
+	async buildFlutterWeb(opts = {}) {
+		const args = ['build', 'web', '--release'];
+		if (opts.verbose) args.push('-v');
+		await this.runFlutter(args);
+	}
+
+	/**
 	 * FILE & IGNORE METHODS
 	*/
-	loadIgnore(includeDependencies = false) { 
+	loadIgnore(includeDependencies = false) {
 		const ig = ignore();
 		const ignoreFile = path.join(this.ROOT, '.updateignore');
 
@@ -239,13 +1254,12 @@ class App {
 			ig.add(content.split('\n').filter(line => line.trim() && !line.startsWith('#')));
 		}
 
-		// Always ignore these files
 		let exclusives = [
 			'.git',
 			'.last-deploy',
 			'.gitattributes',
 			'.updateignore',
-			'.xfixrc.json', 
+			'.xfixrc.json',
 			'deploy.zip',
 			'.DS_Store',
 			'Thumbs.db',
@@ -261,7 +1275,6 @@ class App {
 			'.svn/',
 			'.env.example',
 
-			// harmful/unneccessary files
 			'vendor/**/[..*',
 			'vendor/**/[..*.*',
 			'vendor/**/[...*',
@@ -279,7 +1292,6 @@ class App {
 			'node_modules/**/process.env.js'
 		];
 
-		// Conditionally ignore vendor and node_modules
 		if (!includeDependencies) {
 			exclusives.push(
 				'vendor',
@@ -288,25 +1300,23 @@ class App {
 		}
 
 		ig.add(exclusives);
-		
+
 		return ig;
 	}
 
 	filterFiles(files, ig) {
 		const filtered = [];
 		const excluded = [];
-	
+
 		files.forEach((changedFile) => {
 			let rel;
-			
-			// Handle both string paths and change objects
+
 			if (typeof changedFile === 'string') {
 				rel = path.relative(this.ROOT, changedFile);
 			} else {
-				// Extract relative path from change object
 				rel = changedFile.file || path.relative(this.ROOT, changedFile.fullPath);
 			}
-	
+
 			const isIgnored = ig.ignores(rel);
 
 			if (isIgnored) {
@@ -316,13 +1326,13 @@ class App {
 				filtered.push(changedFile);
 			}
 		});
-	
+
 		return {
 			filtered,
 			excluded
 		};
 	}
-	
+
     /**
      * Get the last deploy hash for the current distribution
      */
@@ -358,7 +1368,7 @@ class App {
     async getDeployStatus() {
         const lastHash = await this.getLastDeployHash();
         const currentHash = (await this.git.revparse(['HEAD'])).trim();
-        
+
         return {
             lastHash,
             currentHash,
@@ -381,7 +1391,7 @@ class App {
                     distribution: distName
                 };
             });
-        
+
         return markers;
     }
 
@@ -413,10 +1423,8 @@ class App {
             includeCommitted = true
         } = options;
 
-        // Get last deploy hash for this distribution
         let lastDeploy = await this.getLastDeployHash();
 
-        // First deploy - all tracked files (only for non-secure mode)
         if (!lastDeploy && includeCommitted) {
             try {
                 const files = await this.git.raw(['ls-files']);
@@ -436,7 +1444,6 @@ class App {
                 this.options.included = changes.length;
                 this.options.excluded = 0;
 
-                // Create initial deploy marker after first deployment
                 if (this.options.deploy) {
                     await this.updateDeployMarker();
                 }
@@ -450,7 +1457,6 @@ class App {
         try {
             let allChanges = [];
 
-            // Get committed changes if requested
             if (includeCommitted && lastDeploy) {
                 const diffArgs = stagedOnly ? ['--cached'] : [];
                 const diff = await this.git.diff([
@@ -459,38 +1465,33 @@ class App {
                     ...diffArgs,
                     `${lastDeploy}..HEAD`
                 ]);
-                
-                const committedChanges = this.parseDiffOutput(diff, { 
+
+                const committedChanges = this.parseDiffOutput(diff, {
                     committed: true,
-                    staged: true 
+                    staged: true
                 });
-                
+
                 allChanges.push(...committedChanges);
             }
 
-            // Get unstaged changes if requested
             if (includeUnstaged) {
                 const unstagedChanges = await this.getUnstagedChanges();
                 allChanges.push(...unstagedChanges);
             }
 
-            // Get untracked files if requested
             if (includeUntracked) {
                 const untrackedFiles = await this.getUntrackedFiles();
                 allChanges.push(...untrackedFiles);
             }
 
-            // Remove duplicates
             allChanges = this.deduplicateChanges(allChanges);
 
-            // Warn if no changes detected
             if (allChanges.length === 0 && config.verbose) {
                 this.log(`No changes detected for ${this.distributionName}`, true, 'info');
             }
 
-            // Update stats and display
             this.updateChangeStats(allChanges, config);
-            
+
             return allChanges;
 
         } catch (error) {
@@ -504,37 +1505,29 @@ class App {
         }
     }
 
-	/**
-	 * Remove duplicate file entries, preferring unstaged versions
-	 */
 	deduplicateChanges(changes) {
 		const fileMap = new Map();
-		
+
 		changes.forEach(change => {
 			const key = change.file;
-			
+
 			if (!fileMap.has(key)) {
 				fileMap.set(key, change);
 			} else {
-				// Prefer unstaged/untracked versions over committed
 				const existing = fileMap.get(key);
 				if (change.staged === false || change.untracked) {
 					fileMap.set(key, change);
 				}
 			}
 		});
-		
+
 		return Array.from(fileMap.values());
 	}
-	
-	/**
-	 * Get unstaged changes in working directory
-	 */
+
 	async getUnstagedChanges() {
 		const status = await this.git.status();
 		const changes = [];
-	
-		// Modified but not staged
+
 		status.modified.forEach(file => {
 			changes.push({
 				status: 'M',
@@ -544,8 +1537,7 @@ class App {
 				committed: false
 			});
 		});
-	
-		// Deleted but not staged
+
 		status.deleted.forEach(file => {
 			changes.push({
 				status: 'D',
@@ -555,8 +1547,7 @@ class App {
 				committed: false
 			});
 		});
-	
-		// Renamed in working directory
+
 		if (status.renamed) {
 			status.renamed.forEach(rename => {
 				changes.push({
@@ -569,20 +1560,17 @@ class App {
 				});
 			});
 		}
-	
+
 		return changes;
 	}
-	
-	/**
-	 * Get untracked files
-	 */
+
 	async getUntrackedFiles() {
 		const untracked = await this.git.raw([
 			'ls-files',
 			'--others',
 			'--exclude-standard'
 		]);
-	
+
 		return untracked
 			.trim()
 			.split('\n')
@@ -596,10 +1584,7 @@ class App {
 				staged: false
 			}));
 	}
-	
-	/**
-	 * Parse git diff output
-	 */
+
 	parseDiffOutput(diff, metadata = {}) {
 		return diff
 			.trim()
@@ -608,14 +1593,13 @@ class App {
 			.map(line => {
 				const parts = line.split('\t');
 				const status = parts[0];
-	
-				// Handle renames (R100, R050, etc.)
+
 				if (status?.startsWith('R')) {
 					const similarity = status.substring(1);
 					const newFile = parts[2];
-	
+
 					if (!newFile) return null;
-	
+
 					return {
 						status: 'R',
 						similarity,
@@ -625,14 +1609,13 @@ class App {
 						...metadata
 					};
 				}
-	
-				// Handle copies
+
 				if (status?.startsWith('C')) {
 					const similarity = status.substring(1);
 					const newFile = parts[2];
-	
+
 					if (!newFile) return null;
-	
+
 					return {
 						status: 'C',
 						similarity,
@@ -642,12 +1625,11 @@ class App {
 						...metadata
 					};
 				}
-	
-				// Handle type changes
+
 				if (status?.startsWith('T')) {
 					const file = parts[1];
 					if (!file || typeof file !== 'string') return null;
-					
+
 					return {
 						status: 'T',
 						file,
@@ -655,11 +1637,11 @@ class App {
 						...metadata
 					};
 				}
-	
+
 				const file = parts[1];
-	
+
 				if (!file || typeof file !== 'string') return null;
-	
+
 				return {
 					status,
 					file,
@@ -669,17 +1651,14 @@ class App {
 			})
 			.filter(Boolean);
 	}
-	
-	/**
-	 * Update change statistics and display
-	 */
+
 	updateChangeStats(changes, config) {
 		if (config.verbose) {
 			const statusCounts = {};
-			
+
 			changes.forEach(change => {
 				let key = change.status;
-				
+
 				if (change.untracked) {
 					key = 'Untracked';
 				} else if (change.staged === false) {
@@ -687,10 +1666,10 @@ class App {
 				} else if (change.committed) {
 					key = `${change.status} (committed)`;
 				}
-				
+
 				statusCounts[key] = (statusCounts[key] || 0) + 1;
 			});
-	
+
 			this.log('Git detected changes:', false, 'git');
 			Object.entries(statusCounts).forEach(([status, count]) => {
 				const statusLabel = {
@@ -709,8 +1688,7 @@ class App {
 				this.log(`${statusLabel}: ${count} files`);
 			});
 		}
-	
-		// Update stats
+
 		this.options.total = changes.length;
 		this.options.included = changes.filter(c => c.status !== 'D').length;
 		this.options.excluded = changes.filter(c => c.status === 'D').length;
@@ -740,40 +1718,34 @@ class App {
 		return files.flat();
 	}
 
-	/**
-	 * Get files for deployment based on mode and options
-	 */
 	async getDeploymentFiles(config, ig) {
 		let files;
-		
-		const isSecure = this.options.obfuscateJs || 
-						config.obfuscateJs || 
-						this.options.obfuscatePhp || 
+
+		const isSecure = this.options.obfuscateJs ||
+						config.obfuscateJs ||
+						this.options.obfuscatePhp ||
 						config.obfuscatePhp;
 
-		// Force full deployment if requested
 		if (this.options.fullDeployment) {
 			this.log('  Force full deployment requested...', true);
 			files = await this.getAllFiles();
 		} else if (isSecure) {
-			// deploy unstaged/working directory changes
 			this.log('  Since you are using secure mode, deploying unstaged changes only...', true);
-			
+
 			const options = {
 				includeUnstaged: true,
 				includeUntracked: this.options.includeUntracked !== false,
 				stagedOnly: false,
 				includeCommitted: false
 			};
-			
+
 			files = await this.getUpdatedFiles(config, options);
-			
-			// If includeDependencies is set, add vendor and node_modules
+
 			if (this.options.includeDependencies) {
 				this.log('  Including vendor/ and node_modules/ in secure deployment...', true);
-				
+
 				const dependencyFiles = await this.getDependencyFiles();
-				
+
 				if (dependencyFiles.length > 0) {
 					files = [...files, ...dependencyFiles];
 					this.log(`  Added ${dependencyFiles.length} dependency files`, true);
@@ -782,32 +1754,30 @@ class App {
 				}
 			}
 		} else {
-			// Non-secure mode: deploy based on options
 			const options = {
 				includeUnstaged: this.options.includeUnstaged || false,
 				includeUntracked: this.options.includeUntracked || false,
 				stagedOnly: this.options.stagedOnly || false,
 				includeCommitted: !this.options.includeUnstaged || this.options.stagedOnly
 			};
-			
+
 			if (config.verbose) {
 				const mode = [];
 				if (options.stagedOnly) mode.push('staged only');
 				if (options.includeUnstaged) mode.push('including unstaged');
 				if (options.includeUntracked) mode.push('including untracked');
 				if (!options.includeCommitted) mode.push('excluding committed');
-				
+
 				this.log(`  Deploying changes: ${mode.length > 0 ? mode.join(', ') : 'committed only'}...`);
 			}
-			
+
 			files = await this.getUpdatedFiles(config, options);
-			
-			// If includeDependencies is set, add vendor and node_modules
+
 			if (this.options.includeDependencies) {
 				this.log('  Including vendor/ and node_modules/ in deployment...', true);
-				
+
 				const dependencyFiles = await this.getDependencyFiles();
-				
+
 				if (dependencyFiles.length > 0) {
 					files = [...files, ...dependencyFiles];
 					this.log(`  Added ${dependencyFiles.length} dependency files`, true);
@@ -817,16 +1787,13 @@ class App {
 			}
 		}
 
-		// Filter through ignore patterns
 		const { filtered, excluded } = this.filterFiles(files, ig, config);
 
 		let filePaths;
 		if (this.options.fullDeployment) {
-			// getAllFiles returns plain strings, use as-is
 			filePaths = filtered;
 		} else {
-			// getUpdatedFiles returns objects with fullPath
-			filePaths = filtered.map(change => { 
+			filePaths = filtered.map(change => {
 				if (typeof change === 'string') {
 					return change;
 				}
@@ -834,7 +1801,6 @@ class App {
 			});
 		}
 
-		// Calculate and update stats
 		const stats = {
 			total: files.length,
 			included: filtered.length,
@@ -845,10 +1811,8 @@ class App {
 		this.options.included = stats['included'];
 		this.options.excluded = stats['excluded'];
 
-		// Display summary
 		this.displayDeploymentSummary(filtered, stats, isSecure);
 
-		// Validate files exist
 		if (!stats.included) {
 			this.throwNoFilesError(isSecure);
 		}
@@ -861,25 +1825,19 @@ class App {
 		};
 	}
 
-	/**
-	 * Get dependency files from vendor and node_modules
-	 * In secure mode, scans filesystem for all dependency files
-	 * In non-secure mode, tries git first, falls back to filesystem
-	 */
 	async getDependencyFiles() {
 		const dependencyPaths = [];
 		const vendorPath = path.join(this.ROOT, 'vendor');
 		const nodeModulesPath = path.join(this.ROOT, 'node_modules');
-		
-		const isSecure = this.options.obfuscateJs || 
-						this.config?.obfuscateJs || 
-						this.options.obfuscatePhp || 
+
+		const isSecure = this.options.obfuscateJs ||
+						this.config?.obfuscateJs ||
+						this.options.obfuscatePhp ||
 						this.config?.obfuscatePhp;
-		
-		try { 
+
+		try {
 			if (await fs.pathExists(vendorPath)) {
 				if (!isSecure) {
-					// Non-secure: Try git first
 					try {
 						const trackedVendorFiles = await this.git.raw([
 							'ls-files',
@@ -888,7 +1846,7 @@ class App {
 							'--exclude-standard',
 							'vendor/'
 						]);
-						
+
 						if (trackedVendorFiles.trim()) {
 							const vendorFiles = trackedVendorFiles
 								.trim()
@@ -902,23 +1860,20 @@ class App {
 									committed: true,
 									staged: true
 								}));
-							
+
 							dependencyPaths.push(...vendorFiles);
 							this.log(`  Found ${vendorFiles.length} vendor files (git)`, true);
 						} else {
-							// Fall back to filesystem
 							const vendorFiles = await this.getFilesFromDirectory(vendorPath);
 							dependencyPaths.push(...vendorFiles);
 							this.log(`  Found ${vendorFiles.length} vendor files (filesystem)`, true);
 						}
 					} catch (error) {
-						// fall back to filesystem
 						const vendorFiles = await this.getFilesFromDirectory(vendorPath);
 						dependencyPaths.push(...vendorFiles);
 						this.log(`  Found ${vendorFiles.length} vendor files (filesystem)`, true);
 					}
 				} else {
-					// Always scan filesystem for all dependency files
 					const vendorFiles = await this.getFilesFromDirectory(vendorPath);
 					dependencyPaths.push(...vendorFiles);
 					this.log(`  Found ${vendorFiles.length} vendor files (filesystem)`, true);
@@ -926,10 +1881,9 @@ class App {
 			} else {
 				this.log('  vendor/ directory not found', true);
 			}
-			
+
 			if (await fs.pathExists(nodeModulesPath)) {
 				if (!isSecure) {
-					// Non-secure: Try git first
 					try {
 						const trackedNodeFiles = await this.git.raw([
 							'ls-files',
@@ -938,7 +1892,7 @@ class App {
 							'--exclude-standard',
 							'node_modules/'
 						]);
-						
+
 						if (trackedNodeFiles.trim()) {
 							const nodeFiles = trackedNodeFiles
 								.trim()
@@ -952,23 +1906,20 @@ class App {
 									committed: true,
 									staged: true
 								}));
-							
+
 							dependencyPaths.push(...nodeFiles);
 							this.log(`  Found ${nodeFiles.length} node_modules files (git)`, true);
 						} else {
-							// Fall back to filesystem
 							const nodeFiles = await this.getFilesFromDirectory(nodeModulesPath);
 							dependencyPaths.push(...nodeFiles);
 							this.log(`  Found ${nodeFiles.length} node_modules files (filesystem)`, true);
 						}
 					} catch (error) {
-						// Git failed, fall back to filesystem
 						const nodeFiles = await this.getFilesFromDirectory(nodeModulesPath);
 						dependencyPaths.push(...nodeFiles);
 						this.log(`  Found ${nodeFiles.length} node_modules files (filesystem)`, true);
 					}
 				} else {
-					// Always scan filesystem for all dependency files
 					const nodeFiles = await this.getFilesFromDirectory(nodeModulesPath);
 					dependencyPaths.push(...nodeFiles);
 					this.log(`  Found ${nodeFiles.length} node_modules files (filesystem)`, true);
@@ -976,54 +1927,47 @@ class App {
 			} else {
 				this.log('  node_modules/ directory not found', true);
 			}
-			
+
 		} catch (error) {
 			this.log(`  Warning: Could not get dependency files: ${error.message}`, true, 'warning');
 		}
-		
+
 		return dependencyPaths;
 	}
 
-	/**
-	 * Get all files from a directory recursively (filesystem scan)
-	 * Used primarily in secure mode to include all dependency files
-	 */
 	async getFilesFromDirectory(dirPath) {
 		const files = [];
-		
+
 		try {
 			const entries = await fs.readdir(dirPath, { withFileTypes: true });
-			
+
 			for (const entry of entries) {
 				const fullPath = path.join(dirPath, entry.name);
 				const relativePath = path.relative(this.ROOT, fullPath).replace(/\\/g, '/');
-				
-				// Skip common unnecessary files in dependencies - ensure safety & security is not compromised
+
 				const skipDirs = ['.git', '.svn', 'test', 'tests', 'docs', 'examples', 'node_modules'];
 				const skipFiles = ['.gitattributes', '.gitignore', '.npmignore', '.eslintrc', 'process.env.js'];
 				const skipExtensions = ['.md', '.markdown', '.txt', '.log'];
-				
+
 				if (entry.isDirectory()) {
-					// Skip unnecessary directories
 					if (skipDirs.includes(entry.name)) {
 						continue;
 					}
-					
+
 					const subFiles = await this.getFilesFromDirectory(fullPath);
 					files.push(...subFiles);
 				} else if (entry.isFile()) {
-					// Skip unnecessary files
 					if (skipFiles.some(f => entry.name.startsWith(f))) {
 						continue;
 					}
-					
+
 					const ext = path.extname(entry.name).toLowerCase();
-					if (skipExtensions.includes(ext) && 
-						entry.name !== 'composer.lock' && 
+					if (skipExtensions.includes(ext) &&
+						entry.name !== 'composer.lock' &&
 						entry.name !== 'package-lock.json') {
 						continue;
 					}
-					
+
 					files.push({
 						status: 'A',
 						file: relativePath,
@@ -1037,13 +1981,10 @@ class App {
 		} catch (error) {
 			this.log(`  Cannot read directory ${dirPath}: ${error.message}`, true);
 		}
-		
+
 		return files;
 	}
 
-	/**
-	 * Display deployment summary
-	 */
 	displayDeploymentSummary(filtered, stats, isSecure) {
 		if (this.options.fullDeployment) {
 			this.log(
@@ -1052,46 +1993,43 @@ class App {
 		} else if (isSecure) {
 			const unstagedCount = filtered.filter(f => f.staged === false && !f.untracked).length;
 			const untrackedCount = filtered.filter(f => f.untracked === true).length;
-			
+
 			let message = `Secure deployment: ${stats.included} unstaged files`;
-			
+
 			const details = [];
 			if (unstagedCount > 0) details.push(`${unstagedCount} modified`);
 			if (untrackedCount > 0) details.push(`${untrackedCount} new/untracked`);
-			
+
 			if (details.length > 0) {
 				message += ` (${details.join(', ')})`;
 			}
-			
+
 			message += `, ${stats.excluded} excluded`;
 			this.log(message, true, 'info');
 		} else {
-			const mode = this.options.stagedOnly ? 'staged' : 
+			const mode = this.options.stagedOnly ? 'staged' :
 						this.options.includeUnstaged ? 'committed + unstaged' : 'committed';
-			
+
 			let message = `Incremental deployment (${mode}): ${stats.included} files`;
-			
+
 			const details = [];
 			const committedCount = filtered.filter(f => f.committed).length;
 			const unstagedCount = filtered.filter(f => f.staged === false && !f.untracked).length;
 			const untrackedCount = filtered.filter(f => f.untracked).length;
-			
+
 			if (committedCount > 0) details.push(`${committedCount} committed`);
 			if (unstagedCount > 0) details.push(`${unstagedCount} unstaged`);
 			if (untrackedCount > 0) details.push(`${untrackedCount} untracked`);
-			
+
 			if (details.length > 0) {
 				message += ` (${details.join(', ')})`;
 			}
-			
+
 			message += `, ${stats.excluded} excluded`;
 			this.log(message, true, 'info');
 		}
 	}
 
-	/**
-	 * Throw descriptive error when no files to deploy
-	 */
 	throwNoFilesError(isSecure) {
 		if (this.options.fullDeployment) {
 			throw new Error(
@@ -1128,7 +2066,7 @@ class App {
 		}
 	}
 
-	/** 
+	/**
 	 * ARCHIVE METHODS
 	*/
 	async createArchive(zipPath, files, config) {
@@ -1174,7 +2112,7 @@ class App {
 		});
 	}
 
-	/** 
+	/**
 	 * DEPLOYMENT METHODS
 	*/
 	async validateBranch(expectedBranch) {
@@ -1226,7 +2164,7 @@ class App {
 				if (staging && staging.status == 'error') {
 					throw new Error(staging.message || 'Unknown staging error');
 				}
-				
+
 				this.log('Remote deployment staging successful', false, 'info');
 				return;
 			} catch (error) {
@@ -1295,7 +2233,7 @@ class App {
 				try {
 					payload = JSON.parse(errorText);
 				} catch {
-					// not JSON — fall through to the raw text
+					// not JSON
 				}
 
 				const message = payload?.message
@@ -1311,8 +2249,8 @@ class App {
 				throw err;
 			}
 
-			const responseData = await res.json(); 
-			if (responseData.status == 'error') { 
+			const responseData = await res.json();
+			if (responseData.status == 'error') {
 				throw new Error(responseData.message || 'Unknown deployment error');
 			}
 
@@ -1342,7 +2280,7 @@ class App {
 			throw error;
 		}
 	}
-	
+
 	async cleanup(zipPath, config) {
 		if (config.cleanupLocal && await fs.pathExists(zipPath)) {
 			await fs.remove(zipPath);
@@ -1350,22 +2288,16 @@ class App {
 		}
 	}
 
-	/**
-	 * Cleanup after deployment (revert obfuscation and clean files)
-	 */
 	async cleanupAfterDeployment(success = true) {
 		try {
-			// Revert JavaScript obfuscation
 			if (this.options.obfuscateJs || this.config?.obfuscateJs) {
 				await this.revert_js_obfuscation();
 			}
 
-			// Revert PHP obfuscation
 			if (this.options.obfuscatePhp || this.config?.obfuscatePhp) {
 				await this.revert_php_obfuscation();
 			}
-			
-			// Clean up deployment zip
+
 			if (success) {
 				const zip_path = path.join(this.ROOT, 'deploy.zip');
 				await this.cleanup(zip_path, this.config);
@@ -1375,43 +2307,27 @@ class App {
 		}
 	}
 
-	/** 
+	/**
 	 * OBFUSCATION METHODS
 	*/
 	get_excluded_js_files() {
 		let excluded = [
-
-			// Exact core libs
 			'vendor.js',
 			'init.js',
-		
-			// jQuery
 			'jquery.js',
 			'jquery.min.js',
 			'jquery-ui.js',
 			'jquery-ui.min.js',
-		
-			// Icons
 			'icons.min.js',
-		
-			// General minified files
 			'**/*.min.js',
-		
-			// Vendor directories
 			'**/vendor/**',
 			'**/node_modules/**',
-		
-			// Large libraries
 			'**/ckeditor*/**',
 			'**/tinymce*/**',
 			'**/datatables*/**',
 			'**/chart*/**',
-		
-			// Build outputs
 			'**/dist/**',
 			'**/build/**',
-		
-			// Optional modern frameworks
 			'**/bootstrap*/**',
 			'**/select2*/**',
 			'**/moment*/**',
@@ -1420,24 +2336,21 @@ class App {
 
 		if (this.config?.exclusiveFiles?.length) {
 			this.config.exclusiveFiles.forEach(file => {
-				// Only exclude JavaScript files for obfuscation
 				if (file.endsWith('.js') || file.endsWith('.mjs') || file.endsWith('.cjs')) {
 					if (!excluded.includes(file)) {
 						excluded.push(file);
 						this.log(`Excluding JS from obfuscation: ${file}`, true);
 					}
 				} else {
-					// For non-JS files, they'll be handled by the PHP obfuscation's ignore list
 					this.log(`Non-JS file in exclusiveFiles: ${file} (handled elsewhere)`, true);
 				}
 			});
 		}
-	
+
 		return excluded;
 	}
 
 	get_obfuscator_config(config) {
-		// Merge domain lock from config with defaults
 		const domainLock = config.domainLock || [
 			'http://localhost',
 			'http://127.0.0.1'
@@ -1482,27 +2395,25 @@ class App {
 			unicodeEscapeSequence: false
 		};
 	}
-	
+
 	async obfuscateJavaScript(srcPath, destPath, config) {
 		this.log('\nStarting JavaScript obfuscation...', false, 'info');
 		this.log(`Source: ${srcPath}`);
 		this.log(`Destination: ${destPath}`);
-	
+
 		if (config.domainLock && config.domainLock.length > 0) {
 			this.log(`Domain Lock: ${config.domainLock.join(', ')}`, false, 'lock');
 			this.log(`Redirect URL: ${config.domainLockRedirectUrl}`, false, 'info');
 		}
-	
-		// Create destination directory
+
 		await fs.ensureDir(destPath);
-	
-		// Preserve originals
+
 		if (config.preserveOriginal) {
 			const preserveDir = config.preserveOriginal;
-	
+
 			if (fs.existsSync(srcPath)) {
 				await this.copy_folder_recursive(srcPath, preserveDir);
-	
+
 				this.log(
 					`Original files preserved in: ${preserveDir}`,
 					false,
@@ -1510,28 +2421,26 @@ class App {
 				);
 			}
 		}
-	
+
 		const exclude_files = this.get_excluded_js_files();
 		const obfuscator_config = this.get_obfuscator_config(config);
-	
-		// Get all JS files
+
 		const files = glob.sync(`${srcPath}/**/*.js`, {
 			nodir: true
 		});
-	
+
 		for (const file of files) {
 			try {
-	
+
 				const relativePath = path.relative(srcPath, file);
-	
-				// Skip excluded files
+
 				const isExcluded = exclude_files.some(excluded =>
 					relativePath.includes(excluded)
 				);
-	
+
 				if (isExcluded) {
 					const destFile = path.join(destPath, relativePath);
-	
+
 					await fs.ensureDir(path.dirname(destFile));
 					await fs.copy(file, destFile);
 					if (config.verbose) {
@@ -1540,57 +2449,51 @@ class App {
 
 					continue;
 				}
-	
-				// Skip large/minified/vendor files
+
 				const stat = await fs.stat(file);
-	
+
 				if (
-					stat.size > 1024 * 1024 || // 1MB+
+					stat.size > 1024 * 1024 ||
 					file.includes('.min.js') ||
 					file.includes('/vendor/') ||
 					file.includes('/node_modules/')
 				) {
 					const destFile = path.join(destPath, relativePath);
-	
+
 					await fs.ensureDir(path.dirname(destFile));
 					await fs.copy(file, destFile);
-	
+
 					if (config.verbose) {
 						this.log(`Copied without obfuscation: ${relativePath}`, false, 'warning');
 					}
 
 					continue;
 				}
-	
 
 				if (config.verbose) {
 					this.log(`Obfuscating: ${relativePath}`);
 				}
 
-				// Read source
 				const code = await fs.readFile(file, 'utf8');
-	
-				// Obfuscate
+
 				const obfuscated = JavaScriptObfuscator
 						.obfuscate(code, obfuscator_config)
 						.getObfuscatedCode();
-	
-				// Write output
+
 				const destFile = path.join(destPath, relativePath);
-	
+
 				await fs.ensureDir(path.dirname(destFile));
-	
+
 				await fs.writeFile(destFile, obfuscated);
-	
-				// Release references
+
 				global.gc?.();
-	
+
 			} catch (error) {
 				this.log(`Failed: ${file}`, false, 'error');
 				console.error(error);
 			}
 		}
-	
+
 		this.log('JavaScript obfuscation completed', false, 'success');
 	}
 
@@ -1605,38 +2508,23 @@ class App {
 			}
 		}
 	}
-	
-	/**
-	 * Obfuscates PHP files using yakpro-po.
-	 * 
-	 * @returns {Promise<void>}
-	 */
+
 	async obfuscatePhp() {
 		this.log('\nStarting PHP obfuscation...', false, 'info');
-		
+
 		const localCandidates = process.platform === 'win32'
 			? [
-				// project root, directly
 				path.join(this.ROOT, 'yakpro-po.bat'),
 				path.join(this.ROOT, 'yakpro-po.cmd'),
 				path.join(this.ROOT, 'yakpro-po'),
-
-				// Composer-installed in this project
 				path.join(this.ROOT, 'vendor', 'bin', 'yakpro-po.bat'),
 				path.join(this.ROOT, 'vendor', 'bin', 'yakpro-po.cmd'),
-
-				// npm-installed in this project
 				path.join(this.ROOT, 'node_modules', '.bin', 'yakpro-po.cmd'),
 				path.join(this.ROOT, 'node_modules', '.bin', 'yakpro-po.bat'),
 			]
 			: [
-				// project root, directly
 				path.join(this.ROOT, 'yakpro-po'),
-
-				// Composer-installed in this project
 				path.join(this.ROOT, 'vendor', 'bin', 'yakpro-po'),
-
-				// npm-installed in this project
 				path.join(this.ROOT, 'node_modules', '.bin', 'yakpro-po'),
 			];
 
@@ -1685,7 +2573,7 @@ class App {
 				false, 'warn'
 			);
 		}
-		
+
 		const cnf = path.join(this.ROOT, 'yakpro-po.cnf');
 
 		if (!await fs.pathExists(cnf)) {
@@ -1695,8 +2583,6 @@ class App {
 			);
 		}
 
-		// Verify the magic marker on line 2 — otherwise yakpro silently
-		// falls back to the packaged default and mangles class names.
 		const cnfHead = (await fs.readFile(cnf, 'utf-8'))
 			.split(/\r?\n/)
 			.slice(0, 2);
@@ -1712,7 +2598,7 @@ class App {
 		}
 
 		this.log(`Config: ${path.relative(this.ROOT, cnf)}`, true);
-		
+
 		const includeDeps = this.options.includeDependencies || false;
 		const ig = this.loadIgnore(includeDeps);
 
@@ -1736,7 +2622,7 @@ class App {
 		}
 
 		this.log(`Found ${phpFiles.length} PHP files to obfuscate`, false, 'info');
-		
+
 		let processed = 0;
 		let failed = 0;
 		const total = phpFiles.length;
@@ -1745,7 +2631,6 @@ class App {
 
 		const obfuscatedRoot = path.join(this.ROOT, 'obfuscated');
 
-		// Wipe any stale output from a previous aborted run
 		if (await fs.pathExists(obfuscatedRoot)) {
 			await fs.remove(obfuscatedRoot);
 		}
@@ -1757,7 +2642,6 @@ class App {
 			const outputDir = path.dirname(outputFile);
 
 			try {
-				// yakpro 2.0.14 does NOT create the output dir itself
 				await fs.ensureDir(outputDir);
 
 				const percent = Math.round(((index + 1) / total) * 100);
@@ -1769,8 +2653,6 @@ class App {
 					`\r   [${index + 1}/${total}] ${percent}% - ${displayFile.padEnd(40)}`
 				);
 
-				// --config-file is the only flag name yakpro 2.0.14 accepts.
-				// -c causes "Too much parameters" and falls back to defaults.
 				execSync(
 					`"${yakproPath}" "${sourcePath}" -o "${outputFile}" --config-file "${cnf}"`,
 					{
@@ -1779,7 +2661,6 @@ class App {
 					}
 				);
 
-				// yakpro can exit 0 and still fail to write the file
 				if (!await fs.pathExists(outputFile)) {
 					throw new Error(
 						`yakpro exited successfully but produced no output at ${outputFile}`
@@ -1795,8 +2676,6 @@ class App {
 					error: error.message
 				});
 
-				// Log the first few failures at non-verbose level so silent
-				// mass failure is visible immediately.
 				if (failed <= 5) {
 					this.log(`Failed: ${file}`, false, 'error');
 					this.log(`  ${error.message.split('\n')[0]}`, false, 'error');
@@ -1806,7 +2685,6 @@ class App {
 
 		const duration = ((Date.now() - startTime) / 1000).toFixed(2);
 
-		// Clear the progress line
 		process.stdout.write('\r' + ' '.repeat(80) + '\r');
 
 		this.log(' ', false, 'space');
@@ -1817,7 +2695,7 @@ class App {
 		if (failed > 0) {
 			this.log(`Failed: ${failed} files`, false, 'error');
 		}
-		
+
 		if (processed === 0) {
 			throw new Error(
 				'PHP obfuscation produced no output. Aborting before the ' +
@@ -1831,7 +2709,7 @@ class App {
 				'Aborting to avoid shipping partially-obfuscated code.'
 			);
 		}
-		
+
 		this.log('\nReplacing original PHP files with obfuscated versions...', false, 'info');
 
 		await this.replace_php_files(phpFiles, failedFiles);
@@ -1840,10 +2718,6 @@ class App {
 		this.log(' ', false, 'space');
 	}
 
-	/**
-	 * Replace original PHP files with obfuscated versions
-	 * Creates a backup of originals first
-	 */
 	async replace_php_files(phpFiles, failedFiles) {
 		const failedFileNames = new Set(failedFiles.map(f => f.file));
 		const backupDir = path.join(this.ROOT, 'original_php_backup');
@@ -1854,7 +2728,6 @@ class App {
 		let backedUp = 0;
 
 		for (const file of phpFiles) {
-			// Skip files that failed obfuscation
 			if (failedFileNames.has(file)) {
 				continue;
 			}
@@ -1864,20 +2737,16 @@ class App {
 			const backupPath = path.join(backupDir, file);
 
 			try {
-				// Check if obfuscated file exists
 				if (!fs.existsSync(obfuscatedPath)) {
 					this.log(`Obfuscated file not found: ${file}`, true);
 					continue;
 				}
 
-				// Create backup directory
 				await fs.ensureDir(path.dirname(backupPath));
 
-				// Backup original file
 				await fs.copyFile(originalPath, backupPath);
 				backedUp++;
 
-				// Replace original with obfuscated
 				await fs.copyFile(obfuscatedPath, originalPath);
 				replaced++;
 
@@ -1893,7 +2762,6 @@ class App {
 		this.log(`Backed up: ${backedUp} original files`);
 		this.log(`Replaced: ${replaced} files with obfuscated versions`);
 
-		// Clean up obfuscated directory after successful replacement
 		if (replaced > 0) {
 			try {
 				await fs.remove(path.join(this.ROOT, 'obfuscated'));
@@ -1904,9 +2772,6 @@ class App {
 		}
 	}
 
-	/**
-	 * Scan PHP files manually using ignore rules
-	 */
 	async scan_php_files_with_ignore(ig) {
 		const phpFiles = [];
 
@@ -1920,10 +2785,8 @@ class App {
 					const fullPath = path.join(dir, entry.name);
 					const relPath = relativePath ? path.join(relativePath, entry.name) : entry.name;
 
-					// Normalize path separators for ignore matching
 					const normalizedPath = relPath.replace(/\\/g, '/');
 
-					// Check if path is ignored
 					if (ig.ignores(normalizedPath)) {
 						this.log(`Ignored: ${normalizedPath}`, true);
 						continue;
@@ -1944,9 +2807,6 @@ class App {
 		return phpFiles;
 	}
 
-	/**
-	 * Revert PHP files back to originals from backup
-	 */
 	async revert_php_obfuscation() {
 		const backupDir = path.join(this.ROOT, 'original_php_backup');
 
@@ -1957,16 +2817,13 @@ class App {
 
 		this.log('\nReverting PHP files to original versions...', false, 'info');
 
-		// Count backup files
 		const backupFiles = await this.count_files_recursive(backupDir);
 		this.log(`Found ${backupFiles} backed up PHP files`);
 
-		// Copy backup files back to original locations
 		await this.copy_folder_recursive(backupDir, this.ROOT);
 
 		this.log(`Reverted ${backupFiles} PHP files`);
 
-		// Clean up backup
 		try {
 			await fs.remove(backupDir);
 			this.log('Cleaned up backup directory', false, 'info');
@@ -1975,16 +2832,12 @@ class App {
 		}
 	}
 
-	/**
-	 * Revert JavaScript files back to originals
-	 */
 	async revert_js_obfuscation() {
 		const config = await this.loadConfig();
 		const jsSrc = this.options.jsSrcPath || config.jsSrcPath || 'public/js';
 		const jsDest = this.options.jsDestPath || config.jsDestPath || 'public/orig';
 		const preserveDir = config.preserveOriginal || 'public/original_js_asset_folder';
 
-		// Check if obfuscated version exists
 		if (!fs.existsSync(jsDest)) {
 			this.log('No obfuscated JavaScript found. Nothing to revert.', true);
 			return;
@@ -1992,24 +2845,19 @@ class App {
 
 		this.log('\nReverting JavaScript files to original versions...', false, 'info');
 
-		// If we have a backup, restore from it
 		if (fs.existsSync(preserveDir)) {
 			this.log(`Restoring from backup: ${preserveDir}`);
 
-			// Remove current obfuscated files
 			if (fs.existsSync(jsSrc)) {
 				await fs.remove(jsSrc);
 			}
 
-			// Restore original files
 			await fs.ensureDir(jsSrc);
 			await this.copy_folder_recursive(preserveDir, jsSrc);
 
-			// Clean up backup
 			await fs.remove(preserveDir);
 			this.log('   Cleaned up backup directory', false, 'info');
 		} else {
-			// No backup, try swapping directories back
 			if (fs.existsSync(jsDest)) {
 				this.log('   Swapping directories back...', false, 'info');
 				await this.rename_directories(jsDest, jsSrc);
@@ -2019,9 +2867,6 @@ class App {
 		this.log('JavaScript files reverted successfully', false, 'info');
 	}
 
-	/**
-	 * Count files in a directory recursively
-	 */
 	async count_files_recursive(dir) {
 		let count = 0;
 
@@ -2054,17 +2899,14 @@ class App {
 		const tempPath = path.join(path.dirname(srcPath), '__xfix_temp__');
 
 		try {
-			// Rename src directory to a temporary name
 			await fs.move(srcPath, tempPath, {
 				overwrite: true
 			});
 
-			// Rename dest directory to src directory name
 			await fs.move(destPath, srcPath, {
 				overwrite: true
 			});
 
-			// Rename temp directory to dest directory name
 			await fs.move(tempPath, destPath, {
 				overwrite: true
 			});
@@ -2073,7 +2915,6 @@ class App {
 		} catch (error) {
 			this.log(`Directory swap failed: ${error.message}`, true, 'error');
 
-			// Attempt recovery
 			try {
 				if (fs.existsSync(tempPath)) {
 					await fs.move(tempPath, srcPath, {
@@ -2087,7 +2928,7 @@ class App {
 			throw error;
 		}
 	}
-	
+
 	async generateControllers(controllers = []) {
 		this.log('\nGenerating controllers...', false, 'info');
 
@@ -2107,12 +2948,11 @@ class App {
 				existing++;
 				continue;
 			}
-			
-			// Read the controller template 
+
 			let templateContent = await this.templatesReader('controllers/template.php', {
 				controller_name: controller_name
 			});
-			
+
 			await fs.writeFile(controller_file_path, templateContent);
 			this.log(`Controller '${controller_name}' generated`);
 			generated++;
@@ -2124,8 +2964,8 @@ class App {
 			existing
 		};
 	}
-	
-	/** 
+
+	/**
 	 * UTILITY METHODS
 	*/
 	async copy_folder_recursive(source, target) {
@@ -2149,33 +2989,24 @@ class App {
 		}
 	}
 
-	/**
-	 * Main deployment pipeline
-	 */
 	async deploy() {
 		let deployedOk = false;
 		const start_time = Date.now();
 		const config = await this.loadConfig();
-		
+
 		try {
 			this.log('Starting XFIX deployment...', false, 'deploy');
 
-			// Validate configuration
 			this.validateConfig(config);
 
-			// Create Services - Make services ready available in production
 			const framework = config?.framework || 'selfphp';
 			if (framework === 'selfphp') {
 				this.createService({
 					name: 'MigrationRunner',
 					type: 'migration',
-					verbose: this.options.verbose || false, 
+					verbose: this.options.verbose || false,
 				});
 			}
-
-			// ============================================
-			// PRE-DEPLOYMENT: Obfuscation
-			// ============================================
 
 			if (this.options.obfuscateJs || config.obfuscateJs) {
 				const js_src = this.options.jsSrcPath || config.jsSrcPath || 'public/js';
@@ -2195,48 +3026,40 @@ class App {
 			}
 
 			let secure = false;
-			if (this.options.obfuscateJs || 
-				config.obfuscateJs || 
-				this.options.obfuscatePhp || 
+			if (this.options.obfuscateJs ||
+				config.obfuscateJs ||
+				this.options.obfuscatePhp ||
 				config.obfuscatePhp) {
 				secure = true;
 			}
 
-			// ============================================
-			// DEPLOYMENT PIPELINE
-			// ============================================
-
-			// Validate branch
 			await this.validateBranch(config?.branch || 'main');
 
-			// Scan and filter files
 			this.log('Scanning project files...', false, 'scan');
 			const includeDeps = this.options.includeDependencies || false;
-			const ig = this.loadIgnore(includeDeps); 
-			
+			const ig = this.loadIgnore(includeDeps);
+
 			const { filePaths, stats, isSecure } = await this.getDeploymentFiles(config, ig);
 
 			if (!stats.included) return;
 
-			// Create archive
 			const zip_path = path.join(this.ROOT, 'deploy.zip');
 			this.log('Creating archive...', false, 'archive');
 			await this.createArchive(zip_path, filePaths, config);
 
-			// Upload to server
 			this.log('Connecting to server...', false, 'connect');
 
 			let client;
 
-			try { 
+			try {
 				if (config.protocol === 'sftp') {
-					client = new SftpClient(); 
+					client = new SftpClient();
 
 					const accessOptions = {
 						host: config.host,
 						port: config.port || 22,
 						username: config.username,
-						password: config.password, 
+						password: config.password,
 						readyTimeout: config.readyTimeout || 30000,
 						retries: config.maxRetries || 3,
 						retry_factor: config.retryFactor || 2,
@@ -2248,7 +3071,7 @@ class App {
 							console.log(`[SFTP] ${message}`);
 						};
 					}
-					
+
 					await client.connect(accessOptions);
 
 					this.log('Connected to server', false, 'success');
@@ -2281,7 +3104,7 @@ class App {
 						accessOptions.secureOptions = {
 							rejectUnauthorized: config.rejectUnauthorized,
 						};
-					} 
+					}
 
 					client = new ftp.Client(config.ftpTimeout);
 
@@ -2329,18 +3152,14 @@ class App {
 
 		} catch (error) {
 			const zip_path = path.join(this.ROOT, 'deploy.zip');
-			await this.cleanup(zip_path, config);  
+			await this.cleanup(zip_path, config);
 			throw error;
 		}
 		finally {
-			// cleanup after deployment
 			await this.cleanupAfterDeployment(true);
 		}
 	}
 
-	/**
-	 * Obfuscation only pipeline (no deployment)
-	 */
 	async obfuscateOnly() {
 		const start_time = Date.now();
 		const config = await this.loadConfig();
@@ -2348,7 +3167,6 @@ class App {
 		try {
 			this.log('Starting obfuscation process...\n', false, 'info');
 
-			// JavaScript obfuscation
 			if (this.options.obfuscateJs || config.obfuscateJs) {
 				const js_src = this.options.jsSrcPath || config.jsSrcPath || 'public/js';
 				const js_dest = this.options.jsDestPath || config.jsDestPath || 'public/orig';
@@ -2360,11 +3178,9 @@ class App {
 
 				await this.obfuscateJavaScript(js_src, js_dest, config);
 
-				// Swap directories for production use
 				await this.rename_directories(js_src, js_dest);
 			}
 
-			// PHP obfuscation
 			if (this.options.obfuscatePhp || config.obfuscatePhp) {
 				await this.obfuscatePhp();
 			}
@@ -2377,20 +3193,16 @@ class App {
 			throw error;
 		}
 	}
-	
+
 	/**
 	* DATABASE MIGRATION & SEED METHODS
 	*/
 
-	/**
-	 * Initialize database connection and migration system
-	 */
 	async initDatabase() {
 		if (this.db) return this.db;
-		
+
 		const config = await this.loadConfig();
-		
-		// Load database config from environment or config file
+
 		this.dbConfig = {
 			host: config.databaseHost,
 			user: config.databaseUser,
@@ -2401,22 +3213,19 @@ class App {
 			connectionLimit: config.databaseConnectionLimit,
 			queueLimit: config.databaseQueueLimit
 		};
-		
+
 		try {
 			this.db = await mysql.createConnection(this.dbConfig);
 			await this.createMigrationsTable();
-			
+
 			this.log('Database connected successfully', true);
-			
+
 			return this.db;
 		} catch (error) {
 			throw new Error(`Database connection failed: ${error.message}`);
 		}
 	}
 
-	/**
-	 * Create migrations tracking table
-	 */
 	async createMigrationsTable() {
 		const sql = `
 			CREATE TABLE IF NOT EXISTS migrations (
@@ -2427,272 +3236,230 @@ class App {
 				UNIQUE KEY unique_migration (migration)
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 		`;
-		
+
 		await this.db.execute(sql);
 	}
 
-	/**
-	 * Create a new migration file
-	 */
 	async createMigration(options) {
 		const { name, table, template = 'create', lang = 'js', verbose } = options;
-		
-		// Generate timestamp for migration filename
+
 		const now = new Date();
 		const timestamp = now.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
-		
-		// Determine file extension based on language
+
 		const extension = lang === 'php' ? '.php' : '.mjs';
-		
+
 		const filename = `${timestamp}_${name}${extension}`;
 		const migrationsDir = path.join(this.ROOT, 'public/storage/database', 'migrations');
-		
-		// Ensure migrations directory exists
+
 		await fs.ensureDir(migrationsDir);
-		
+
 		const filepath = path.join(migrationsDir, filename);
-		
-		// Generate migration template based on type and language
+
 		let templateContent = await this.getMigrationTemplate(template, name, table, lang);
-		
-		// Remove backticks from template content (for PHP files)
+
 		if (lang === 'php') {
 			templateContent = templateContent.replace(/`/g, '');
 		}
-		
-		// Write the migration file
+
 		await fs.writeFile(filepath, templateContent);
-		
+
 		if (verbose) {
 			this.log(`Created ${lang.toUpperCase()} migration: ${filename}`);
 		} else {
 			this.log(`Created: ${filename} (${lang.toUpperCase()})`);
 		}
-		
-		// Auto-generate MigrationRunner for PHP projects
+
 		if (lang === 'php') {
 			await this.ensureMigrationRunnerExists();
 		}
-		
+
 		return filepath;
 	}
 
-	/**
-	 * Get migration template content from partials folder
-	 */
 	async getMigrationTemplate(type, name, table, lang = 'js') {
 		const timestamp = new Date().toISOString();
 		const tableName = table || name.replace(/_table$/, '');
-		
+
 		let templatePath;
-		
-		// Select template based on type and language
+
 		switch(type) {
 			case 'create':
 				templatePath = `migrations/create.${lang}`;
 				break;
-			
+
 			case 'alter':
 				templatePath = `migrations/alter.${lang}`;
 				break;
-			
+
 			case 'drop':
 				templatePath = `migrations/drop.${lang}`;
 				break;
-			
+
 			default:
 				templatePath = `migrations/default.${lang}`;
 				break;
 		}
-		
-		// Generate class name for PHP migrations
+
 		const className = this.generateClassName(name);
-		
-		// Read and process the template
+
 		const templateContent = await this.templatesReader(templatePath, {
 			name: name,
 			tableName: tableName,
 			timestamp: timestamp,
 			className: className
 		});
-		
+
 		return templateContent;
 	}
 
-	/**
-	 * Generate class name from migration name
-	 */
 	generateClassName(name) {
-		// Remove timestamp prefix if present
 		const nameWithoutTimestamp = name.replace(/^\d+_/, '');
-		
-		// Convert snake_case to PascalCase
+
 		return nameWithoutTimestamp
 			.split('_')
 			.map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
 			.join('');
 	}
 
-	/**
-	 * Template reader utility
-	 */
-	async templatesReader(templatePath, variables = {}) { 
+	async templatesReader(templatePath, variables = {}) {
 		const __filename = fileURLToPath(import.meta.url);
 		const __dirname = path.dirname(__filename);
 		const partialsDir = path.join(__dirname, 'partials');
 		const fullPath = path.join(partialsDir, templatePath);
-		
+
 		if (!await fs.pathExists(fullPath)) {
 			throw new Error(`Template file not found: ${fullPath}`);
 		}
-		
+
 		let templateContent = await fs.readFile(fullPath, 'utf-8');
-		
-		// Replace all variables in the template
+
 		for (const [key, value] of Object.entries(variables)) {
-			const placeholder = `{{${key}}}`; 
+			const placeholder = `{{${key}}}`;
 			templateContent = templateContent.split(placeholder).join(value);
 		}
-		
-		const templatePathExt = templatePath.split('.').pop();
-		
-		if (templatePathExt.trim() == 'php') {
-			// Remove backticks from template content
-			templateContent = templateContent.replace(/`/g, ''); 
 
-			// Remove semicolons after closing braces
+		const templatePathExt = templatePath.split('.').pop();
+
+		if (templatePathExt.trim() == 'php') {
+			templateContent = templateContent.replace(/`/g, '');
+
 			templateContent = templateContent.replace(/}(\s*);/g, '}$1');
-			
-			// Remove extra semicolons that became orphaned
+
 			templateContent = templateContent.replace(/^\s*;\s*$/gm, '');
 		}
 
 		return templateContent;
 	}
 
-	/**
-	 * Run pending migrations
-	 */
 	async runMigrations(options = {}) {
 		const { step, dryRun = false, verbose = false } = options;
-		
-		// Ensure database is initialized
+
 		await this.initDatabase();
-		
+
 		try {
 			const migrationsDir = path.join(this.ROOT, 'public/storage/database', 'migrations');
-			
+
 			if (!await fs.pathExists(migrationsDir)) {
 				this.log('No migrations directory found. Creating...', false, 'info');
 				await fs.ensureDir(migrationsDir);
 				return;
 			}
-			
-			// Get all migration files
+
 			let migrationFiles = await fs.readdir(migrationsDir);
 			migrationFiles = migrationFiles.filter(file => file.endsWith('.mjs')).sort();
-			
+
 			if (migrationFiles.length === 0) {
 				this.log('No migration files found', false, 'info');
 				return;
 			}
-			
-			// Get already executed migrations
+
 			const [executed] = await this.db.execute(
 				'SELECT migration FROM migrations ORDER BY batch, id'
 			);
 			const executedMigrations = new Set(executed.map(row => row.migration));
-			
-			// Filter pending migrations
+
 			let pending = migrationFiles.filter(file => !executedMigrations.has(file));
-			
+
 			if (step && step > 0) {
 				pending = pending.slice(0, step);
 			}
-			
+
 			if (pending.length === 0) {
 				this.log('No pending migrations', false, 'info');
 				return;
 			}
-			
+
 			if (dryRun) {
 				this.log('\nPending migrations:', false, 'info');
 				pending.forEach(file => this.log(`- ${file}`));
 				return;
 			}
-			
-			// Get current batch number
+
 			const [lastBatch] = await this.db.execute(
 				'SELECT COALESCE(MAX(batch), 0) as max_batch FROM migrations'
 			);
 			const currentBatch = (lastBatch[0].max_batch || 0) + 1;
-			
+
 			this.log(`\nRunning ${pending.length} migration(s) in batch ${currentBatch}...\n`, true, 'infor');
-			
-			// Run migrations
+
 			let successCount = 0;
 			let errorCount = 0;
-			
+
 			for (const file of pending) {
 				if (verbose) {
 					this.log(`Running: ${file}`, true, 'info');
 				}
-				
+
 				try {
 					const migrationPath = path.join(migrationsDir, file);
 					const migration = await import(`file://${migrationPath}`);
-					
+
 					if (typeof migration.up !== 'function') {
 						throw new Error(`Migration ${file} does not export an 'up' function`);
 					}
-					
+
 					await migration.up(this.db);
-					
-					// Record migration
+
 					await this.db.execute(
 						'INSERT INTO migrations (migration, batch) VALUES (?, ?)',
 						[file, currentBatch]
 					);
-					
+
 					successCount++;
 					if (verbose) {
 						this.log(`Completed: ${file}`);
 					} else {
 						this.log(`${file}`);
 					}
-					
+
 				} catch (err) {
 					errorCount++;
 					this.log(`Failed: ${file}`, true, 'error');
 					this.log(`Error: ${err.message}`, false, 'error');
-					
+
 					if (verbose) {
 						this.log(err.stack, true, 'error');
 					}
-					
-					// Stop execution on error
+
 					throw new Error(`Migration failed: ${file} - ${err.message}`);
 				}
 			}
-			
+
 			this.log(`\nMigrations completed: ${successCount} succeeded, ${errorCount} failed`, true, 'info');
-			
+
 		} finally {
 			await this.closeDatabase();
 		}
 	}
 
-	/**
-	 * Rollback migrations
-	 */
 	async rollbackMigrations(options = {}) {
 		const { step = 1, target, dryRun = false, verbose = false } = options;
-		
+
 		await this.initDatabase();
-		
+
 		try {
 			let migrationsToRollback;
-			
+
 			if (target) {
 				const [rows] = await this.db.execute(
 					'SELECT migration FROM migrations WHERE migration >= ? ORDER BY batch DESC, id DESC',
@@ -2701,7 +3468,7 @@ class App {
 				migrationsToRollback = rows;
 			} else {
 				let batches;
-				
+
 				if (step === 1) {
 					const [rows] = await this.db.execute(
 						'SELECT MAX(batch) as batch FROM migrations'
@@ -2714,48 +3481,48 @@ class App {
 					);
 					batches = rows;
 				}
-				
+
 				if (batches.length === 0 || !batches[0].batch) {
 					this.log('No migrations to rollback', false, 'info');
 					return;
 				}
-				
+
 				const batchNumbers = batches.map(b => b.batch);
 				const placeholders = batchNumbers.map(() => '?').join(',');
-				
+
 				const [rows] = await this.db.execute(
 					`SELECT migration FROM migrations WHERE batch IN (${placeholders}) ORDER BY batch DESC, id DESC`,
 					batchNumbers
 				);
 				migrationsToRollback = rows;
 			}
-			
+
 			if (migrationsToRollback.length === 0) {
 				this.log('No migrations to rollback', false, 'info');
 				return;
 			}
-			
+
 			if (dryRun) {
 				this.log('\nMigrations to rollback:', false, 'info');
 				migrationsToRollback.forEach(m => this.log(`- ${m.migration}`));
 				return;
 			}
-			
+
 			this.log(`\nRolling back ${migrationsToRollback.length} migration(s)...\n`);
-			
+
 			const migrationsDir = path.join(this.ROOT, 'public/storage/database', 'migrations');
 			let successCount = 0;
 			let errorCount = 0;
-			
+
 			for (const migration of migrationsToRollback) {
 				const file = migration.migration;
-				
+
 				if (verbose) {
 					this.log(`Rolling back: ${file}`);
 				} else {
 					this.log(`${file}`);
 				}
-				
+
 				try {
 					const migrationPath = path.join(migrationsDir, file);
 					if (!await fs.pathExists(migrationPath)) {
@@ -2767,25 +3534,25 @@ class App {
 						successCount++;
 						continue;
 					}
-					
+
 					const migrationModule = await import(`file://${migrationPath}`);
-					
+
 					if (typeof migrationModule.down !== 'function') {
 						throw new Error(`Migration ${file} does not export a 'down' function`);
 					}
-					
+
 					await migrationModule.down(this.db);
-					
+
 					await this.db.execute(
 						'DELETE FROM migrations WHERE migration = ?',
 						[file]
 					);
-					
+
 					successCount++;
 					if (verbose) {
 						this.log(`Rolled back: ${file}`);
 					}
-					
+
 				} catch (err) {
 					errorCount++;
 					this.log(`Failed to rollback: ${file}`, true, 'error');
@@ -2793,40 +3560,37 @@ class App {
 					throw new Error(`Rollback failed: ${file} - ${err.message}`);
 				}
 			}
-			
+
 			this.log(`\nRollback completed: ${successCount} succeeded, ${errorCount} failed`);
-			
+
 		} finally {
 			await this.closeDatabase();
 		}
 	}
-	
-	/**
-	 * Show migration status
-	 */
+
 	async showMigrationStatus(verbose = false) {
 		await this.initDatabase();
-		
+
 		try {
 			const migrationsDir = path.join(this.ROOT, 'public/storage/database', 'migrations');
-			
+
 			if (!await fs.pathExists(migrationsDir)) {
 				this.log('No migrations directory found', false, 'info');
 				return;
 			}
-			
+
 			let migrationFiles = await fs.readdir(migrationsDir);
 			migrationFiles = migrationFiles.filter(file => file.endsWith('.mjs')).sort();
-			
+
 			if (migrationFiles.length === 0) {
 				this.log('No migration files found', false, 'info');
 				return;
 			}
-			
+
 			const [executed] = await this.db.execute(
 				'SELECT migration, batch, executed_at FROM migrations ORDER BY batch, id'
 			);
-			
+
 			const executedMap = new Map();
 			executed.forEach(row => {
 				executedMap.set(row.migration, {
@@ -2834,24 +3598,24 @@ class App {
 					executed_at: row.executed_at
 				});
 			});
-			
+
 			this.log('\n' + '-'.repeat(50) + '-' + '-'.repeat(10) + '-' + '-'.repeat(25));
 			this.log(' ' + 'Migration'.padEnd(48) + '  ' + 'Status'.padEnd(8) + '  ' + 'Batch/Date'.padEnd(23));
 			this.log('-'.repeat(50) + '-' + '-'.repeat(10) + '-' + '-'.repeat(25));
-			
+
 			for (const file of migrationFiles) {
 				const status = executedMap.get(file);
 				const statusText = status ? 'APPLIED' : 'PENDING';
-				const info = status 
+				const info = status
 					? `Batch ${status.batch}`
 					: 'Not executed';
-				
+
 				const fileName = file.length > 46 ? file.substring(0, 43) + '...' : file;
 				this.log(` ${fileName.padEnd(48)}  ${statusText.padEnd(8)}  ${info.padEnd(23)}`);
 			}
-			
+
 			this.log('-'.repeat(50) + '-' + '-'.repeat(10) + '-' + '-'.repeat(25));
-			
+
 			if (verbose && executed.length > 0) {
 				this.log('\nExecution Details:', false, 'info');
 				for (const row of executed) {
@@ -2859,114 +3623,105 @@ class App {
 					this.log(`- ${row.migration} - Batch ${row.batch} (${date})`);
 				}
 			}
-			
+
 			this.log(`\nSummary: ${executed.length} executed, ${migrationFiles.length - executed.length} pending`);
-			
+
 		} finally {
 			await this.closeDatabase();
 		}
 	}
 
-	/**
-	 * Reset all migrations
-	 */
 	async resetMigrations(options = {}) {
 		const { seed = false, verbose = false } = options;
-		
+
 		this.log('\nResetting database migrations...\n', false, 'info');
-		
+
 		await this.initDatabase();
-		
+
 		const [migrations] = await this.db.execute(
 			'SELECT migration FROM migrations ORDER BY batch DESC, id DESC'
 		);
-		
+
 		if (migrations.length > 0) {
 			this.log(`Found ${migrations.length} migrations to rollback...\n`);
-			
+
 			const migrationsDir = path.join(this.ROOT, 'public/storage/database', 'migrations');
-			
+
 			for (const migration of migrations) {
 				const file = migration.migration;
-				
+
 				if (verbose) {
 					this.log(`Rolling back: ${file}`);
 				}
-				
+
 				try {
 					const migrationPath = path.join(migrationsDir, file);
-					if (await fs.pathExists(migrationPath)) { 
+					if (await fs.pathExists(migrationPath)) {
 						const migrationModule = await import(`file://${migrationPath}`);
-							
+
 						if (typeof migrationModule.down === 'function') {
 							await migrationModule.down(this.db);
 						}
 					}
-					
+
 					await this.db.execute(
 						'DELETE FROM migrations WHERE migration = ?',
 						[file]
 					);
-					
+
 					if (!verbose) {
 						this.log(`${file}`);
 					} else {
 						this.log(`Rolled back: ${file}`);
 					}
-					
+
 				} catch (err) {
 					this.log(`Failed to rollback: ${file}`, true, 'error');
 					this.log(`Error: ${err.message}`, false, 'error');
 					throw err;
 				}
 			}
-			
+
 			this.log(`\nRolled back ${migrations.length} migration(s)\n`);
 		} else {
 			this.log('No migrations to rollback\n', false, 'info');
 		}
-		
+
 		this.log('Running fresh migrations...\n', false, 'info');
 		await this.runMigrations({ verbose });
-		
+
 		if (seed) {
 			this.log('\nRunning seeders...', false, 'info');
 			await this.runSeeders({ force: true, verbose });
 		}
-		
+
 		this.log('\nDatabase reset completed successfully', false, 'info');
 	}
 
-	/**
-	 * Create a new seeder file
-	 */
 	async createSeeder(options) {
 		const { name, verbose } = options;
-		
+
 		const timestamp = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
 		const filename = `${timestamp}_${name}.mjs`;
 		const seedersDir = path.join(this.ROOT, 'public/storage/database', 'seeders');
-		
+
 		await fs.ensureDir(seedersDir);
-		
+
 		const filepath = path.join(seedersDir, filename);
-		
+
 		let templateContent = await this.getSeederTemplate(name, timestamp);
-		
+
 		await fs.writeFile(filepath, templateContent);
-		
+
 		if (verbose) {
 			this.log(`Created seeder: ${filename}`);
 		} else {
 			this.log(`Created: ${filename}`);
 		}
-		
+
 		return filepath;
 	}
 
-	/**
-	 * Get seeder template content
-	 */
 	async getSeederTemplate(name, timestamp) {
 		const templateContent = await this.templatesReader('seeders/default.js', {
 			name: name,
@@ -2976,93 +3731,87 @@ class App {
 		return templateContent;
 	}
 
-	/**
-	 * Run database seeders
-	 */
 	async runSeeders(options = {}) {
 		const { seederClass, force = false, verbose = false } = options;
-		
+
 		await this.initDatabase();
-		
+
 		try {
 			const seedersDir = path.join(this.ROOT, 'public/storage/database', 'seeders');
-			
+
 			if (!await fs.pathExists(seedersDir)) {
 				this.log('No seeders directory found. Creating...', false, 'info');
 				await fs.ensureDir(seedersDir);
-				
+
 				const timestamp = new Date().toISOString();
 				const exampleSeeder = await this.templatesReader('seeders/example.js', {
 					timestamp: timestamp
 				});
-				
+
 				await fs.writeFile(path.join(seedersDir, 'ExampleSeeder.mjs'), exampleSeeder);
 				this.log('   Created example seeder: ExampleSeeder.mjs', false, 'info');
 				return;
 			}
-			
+
 			let seederFiles = await fs.readdir(seedersDir);
 			seederFiles = seederFiles.filter(file => file.endsWith('.js') || file.endsWith('.mjs'));
-			
+
 			if (seederClass) {
 				seederFiles = seederFiles.filter(file => file.includes(seederClass));
 			}
-			
+
 			if (seederFiles.length === 0) {
 				this.log('No seeders found', false, 'info');
 				return;
 			}
-			
+
 			this.log(`\nRunning ${seederFiles.length} seeder(s)...\n`);
-			
+
 			let successCount = 0;
-			
+
 			for (const file of seederFiles) {
 				if (verbose) {
 					this.log(`Running: ${file}`);
 				} else {
 					this.log(`${file}`);
 				}
-				
+
 				try {
-					const seederPath = path.join(seedersDir, file); 
+					const seederPath = path.join(seedersDir, file);
 					const seeder = await import(`file://${seederPath}`);
 
 					if (typeof seeder.run !== 'function') {
 						throw new Error(`Seeder ${file} does not export a 'run' function`);
 					}
-					
+
 					await seeder.run(this.db);
 					successCount++;
-					
+
 					if (verbose) {
 						this.log(`Completed: ${file}`);
 					}
-					
+
 				} catch (err) {
 					this.log(`Failed: ${file}`, true, 'error');
 					this.log(`Error: ${err.message}`, false, 'error');
-					
+
 					if (verbose && err.stack) {
 						this.log(err.stack, true, 'error');
 					}
-					
+
 					if (!force) {
 						throw err;
 					}
 				}
 			}
-			
+
 			this.log(`\nSeeders completed: ${successCount}/${seederFiles.length} succeeded`);
-			
+
 		} finally {
 			await this.closeDatabase();
 		}
 	}
 
-	/**
-	 * Generate multiple services at once
-	 */
 	async generateServices(serviceNames, type = 'general') {
 		this.log('\nGenerating service classes...\n', false, 'info');
 
@@ -3077,13 +3826,13 @@ class App {
 					type: type,
 					verbose: this.options.verbose || false
 				});
-				
+
 				if (result.created) {
 					created++;
 				} else if (result.skipped) {
 					skipped++;
 				}
-				
+
 				results.push(result);
 			} catch (error) {
 				this.log(`Failed to create service '${name}': ${error.message}`, true, 'error');
@@ -3094,7 +3843,7 @@ class App {
 		}
 
 		this.log(`\n   Summary: ${created} created, ${skipped} already existed`, true, 'info');
-		
+
 		return {
 			created,
 			skipped,
@@ -3102,9 +3851,6 @@ class App {
 		};
 	}
 
-	/**
-	 * Create a single service class
-	 */
 	async createService(options) {
 		const { name, type = 'general', verbose } = options;
 
@@ -3142,7 +3888,7 @@ class App {
 		}
 
 		let templateContent = await this.templatesReader(templatePath, templateVariables);
-		
+
 		await fs.writeFile(filepath, templateContent);
 
 		if (verbose) {
@@ -3156,25 +3902,22 @@ class App {
 
 	async ensureMigrationRunnerExists() {
 		const runnerPath = path.join(this.ROOT, 'app/Services/MigrationRunner.php');
-		
+
 		if (!await fs.pathExists(runnerPath)) {
 			this.log('\nMigrationRunner service not found. Creating...', true);
-			
+
 			await this.createService({
 				name: 'MigrationRunner',
 				type: 'migration',
 				verbose: false
 			});
-			
+
 			this.log('   MigrationRunner service auto-generated', false, 'info');
 		} else {
 			this.log('   MigrationRunner already exists', true);
 		}
 	}
 
-	/**
-	 * Close database connection
-	 */
 	async closeDatabase() {
 		if (this.db) {
 			await this.db.end();
