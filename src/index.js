@@ -374,39 +374,56 @@ class CliService {
     }
 
     /**
-     * Build commands (Flutter + Android signing).
+     * Build commands (Flutter + Android signing + app store deploy).
      */
     setupBuildCommand() {
         const buildCmd = this.program
             .command('build')
             .description('Build mobile/desktop apps (Flutter + Android signing)');
 
-        buildCmd
-            .command('apk')
-            .description('Build a signed Android APK via Flutter')
-            .option('--flavor <name>', 'Flutter flavor')
-            .option('--target <path>', 'Dart entrypoint (e.g. lib/main_prod.dart)')
-            .option('--split-per-abi', 'Build split APKs per ABI')
-            .option('--no-sign', 'Skip signing (produce unsigned APK)')
-            .option('--sign-only', 'Skip build, sign existing APK')
-            .option('--apk <path>', 'APK path when using --sign-only')
-            .option('--keystore <path>', 'Override keystore path')
-            .option('--alias <name>', 'Override key alias')
-            .option('--verbose', 'Verbose output')
-            .action(async (options) => {
-                await this.handleBuildApk(options);
-            });
+        const appstoreOptions = (cmd) => cmd
+            .option('--deploy',           'Upload the signed artifact to the app store')
+            .option('--release',          'Upload + create a draft release')
+            .option('--publish',          'Upload + create + publish in one shot')
+            .option('--channel <slug>',   'Release channel (default: config, then "stable")')
+            .option('--app-id <id>',      'Override XFIX app_id for this run')
+            .option('--api-url <url>',    'Override XFIX API base URL for this run')
+            .option('--title <text>',     'Release title')
+            .option('--notes <text>',     'Public release notes')
+            .option('--changelog <text>', 'Changelog body')
+            .option('--rollout <n>',      'Rollout percentage (0-100)', parseInt)
+            .option('--mandatory',        'Mark release as mandatory')
+            .option('--prerelease',       'Mark release as prerelease')
+            .option('--platform <list>',  'Comma-separated platforms, e.g. android,ios');
 
-        buildCmd
-            .command('aab')
-            .description('Build a signed Android App Bundle (AAB) via Flutter')
-            .option('--flavor <name>', 'Flutter flavor')
-            .option('--target <path>', 'Dart entrypoint')
-            .option('--no-sign', 'Skip signing')
-            .option('--verbose', 'Verbose output')
-            .action(async (options) => {
-                await this.handleBuildAab(options);
-            });
+        appstoreOptions(
+            buildCmd
+                .command('apk')
+                .description('Build a signed Android APK via Flutter')
+                .option('--flavor <name>', 'Flutter flavor')
+                .option('--target <path>', 'Dart entrypoint (e.g. lib/main_prod.dart)')
+                .option('--split-per-abi', 'Build split APKs per ABI')
+                .option('--no-sign', 'Skip signing (produce unsigned APK)')
+                .option('--sign-only', 'Skip build, sign existing APK')
+                .option('--apk <path>', 'APK path when using --sign-only')
+                .option('--keystore <path>', 'Override keystore path')
+                .option('--alias <name>', 'Override key alias')
+                .option('--verbose', 'Verbose output')
+        ).action(async (options) => {
+            await this.handleBuildApk(options);
+        });
+
+        appstoreOptions(
+            buildCmd
+                .command('aab')
+                .description('Build a signed Android App Bundle (AAB) via Flutter')
+                .option('--flavor <name>', 'Flutter flavor')
+                .option('--target <path>', 'Dart entrypoint')
+                .option('--no-sign', 'Skip signing')
+                .option('--verbose', 'Verbose output')
+        ).action(async (options) => {
+            await this.handleBuildAab(options);
+        });
 
         buildCmd
             .command('ios')
@@ -434,7 +451,7 @@ class CliService {
                 await this.handleBuildDoctor();
             });
     }
-
+    
     /**
      * Keystore management (JKS).
      */
@@ -1534,6 +1551,8 @@ class CliService {
                 });
             }
 
+            await this._runAppstoreDeploy(app, apkPaths, options);
+
             console.log('\n✅ Build + signing completed\n');
         } catch (err) {
             this.handleError(err, options.verbose);
@@ -1568,6 +1587,8 @@ class CliService {
             console.log('\n🔐 Signing AAB:');
             console.log('─'.repeat(40));
             await app.signAab(aabPath, { verbose: options.verbose || false });
+        
+            await this._runAppstoreDeploy(app, [aabPath], options);
 
             console.log('\n✅ AAB build + signing completed\n');
         } catch (err) {
@@ -1575,6 +1596,68 @@ class CliService {
         }
     }
 
+    /**
+     * Translate the appstore-related Commander options into the shape
+     * App::appstoreDeploy expects.
+     */
+    _appstoreOptsFromCli(options) {
+        if (options.appId)   process.env.XFIX_APP_ID  = options.appId;
+        if (options.apiUrl)  process.env.XFIX_API_URL = options.apiUrl;
+        if (options.channel) process.env.XFIX_CHANNEL = options.channel;
+
+        return {
+            channel:      options.channel,
+            title:        options.title,
+            changelog:    options.changelog,
+            releaseNotes: options.notes,
+            rollout:      options.rollout,
+            mandatory:    options.mandatory,
+            prerelease:   options.prerelease,
+            platforms:    options.platform
+                ? options.platform.split(',').map(s => s.trim()).filter(Boolean)
+                : null,
+            release:      options.release || options.publish,
+            publish:      options.publish,
+        };
+    }
+
+    /**
+     * Run the app store upload after signing. Never throws — the signed
+     * artifact is already on disk and a transient app store error should
+     * not fail the build.
+     */
+    async _runAppstoreDeploy(app, artifactPaths, options) {
+        if (!artifactPaths?.length) return;
+
+        const wantsUpload =
+            options.deploy || options.release || options.publish;
+        if (!wantsUpload) return;
+
+        if (options.sign === false) {
+            console.log('\n⏭️  App store upload skipped (--no-sign)');
+            return;
+        }
+
+        console.log('\n📤 App store upload:');
+        console.log('─'.repeat(40));
+
+        try {
+            const result = await app.appstoreDeploy(
+                artifactPaths,
+                this._appstoreOptsFromCli(options)
+            );
+
+            if (result?.build) {
+                console.log(`   Build:   ${result.build.uuid}`);
+                if (result.release) {
+                    console.log(`   Release: ${result.release.uuid} (${result.release.status})`);
+                }
+            }
+        } catch (err) {
+            app.log(`App store upload failed: ${err.message}`, false, 'error');
+        }
+    }
+    
     async handleBuildIos(options) {
         try {
             const app = new App({ verbose: options.verbose || false });

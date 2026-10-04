@@ -19,6 +19,19 @@ export const ANDROID_SIGNING_PATHS = Object.freeze({
     provisionCommit:  '/api/v1/android-signing/provision/commit',
 });
 
+/**
+ * App store API — fixed route suffixes.
+ *
+ * `{identifier}` is the public `applications.app_id` (e.g.
+ * "app_gigikuyu_gitu_mobile_g67124"). `{uuid}` is an
+ * `application_releases.uuid`.
+ */
+export const APPSTORE_PATHS = Object.freeze({
+    builds:        '/api/v1/appstore/applications/{identifier}/builds',
+    releases:      '/api/v1/appstore/applications/{identifier}/releases',
+    releaseStatus: '/api/v1/appstore/releases/{uuid}/status',
+});
+
 export const DEFAULT_ANDROID_API_URL = 'https://api.xfixglobal.com';
 
 /**
@@ -34,6 +47,18 @@ export const ANDROID_DEFAULTS = Object.freeze({
 });
 
 /**
+ * App store defaults — overridable via .xfixrc.json or env vars.
+ *
+ * `timeout` is higher than the signing default because multipart build
+ * uploads with attached artifacts routinely exceed 10 s on slow links.
+ */
+export const APPSTORE_DEFAULTS = Object.freeze({
+    channel:      'stable',
+    timeout:      60_000,
+    maxArtifacts: 8,
+});
+
+/**
  * Environment variable names — single source of truth so app.js and index.js
  * never disagree.
  */
@@ -41,6 +66,7 @@ export const ANDROID_ENV = Object.freeze({
     appId:            'XFIX_APP_ID',
     apiKey:           'XFIX_API_KEY',
     apiUrl:           'XFIX_API_URL',
+    channel:          'XFIX_CHANNEL',
     keystorePath:     'ANDROID_KEYSTORE_PATH',
     keystorePassword: 'ANDROID_KEYSTORE_PASSWORD',
     keyAlias:         'ANDROID_KEY_ALIAS',
@@ -51,7 +77,8 @@ export const ANDROID_ENV = Object.freeze({
  * Header names.
  */
 export const ANDROID_HEADERS = Object.freeze({
-    appId: 'XFIX-APP-ID',
+    appId:  'XFIX-APP-ID',
+    apiKey: 'XFIX-API-KEY',
 });
 
 export const DEPLOY_HEADERS = Object.freeze({
@@ -66,6 +93,9 @@ export const DEPLOY_HEADERS = Object.freeze({
  * headers to their conventional environment variable names, which the CLI
  * reads from `.env` (loaded via dotenv/config).
  *
+ * The same block is reused for app store uploads — the endpoints share the
+ * same auth contract.
+ *
  * Override in `.xfixrc.json` if your env vars use different names:
  *
  *   "android": {
@@ -79,8 +109,8 @@ export const DEPLOY_HEADERS = Object.freeze({
  */
 export const DEFAULT_ANDROID_AUTH = Object.freeze({
     headers: {
-        [ANDROID_HEADERS.appId]: { env: ANDROID_ENV.appId },
-        'XFIX-API-KEY':          { env: ANDROID_ENV.apiKey },
+        [ANDROID_HEADERS.appId]:  { env: ANDROID_ENV.appId },
+        [ANDROID_HEADERS.apiKey]: { env: ANDROID_ENV.apiKey },
     },
 });
 
@@ -96,22 +126,29 @@ export const USER_AGENTS = Object.freeze({
     signing:      'XFIX-Signing/1.0',
     provisioning: 'XFIX-Provision/1.0',
     deployment:   'XFIX-Deploy/1.0',
+    appstore:     'XFIX-Appstore/1.0',
 });
 
 /**
- * Recover the base API URL from a legacy endpoint URL by stripping the
- * known Android-signing path suffix and any trailing slash.
+ * Recover the base API URL from a known endpoint URL by stripping the
+ * matching path suffix and any trailing slash.
  *
- *   https://api.foo.com/api/v1/android-signing/release             - https://api.foo.com
- *   https://api.foo.com/api/v1/android-signing/provision/prepare   - https://api.foo.com
- *   https://api.foo.com/api/v1/android-signing                     - https://api.foo.com
- *   https://api.foo.com/                                           - https://api.foo.com
+ *   https://api.foo.com/api/v1/android-signing/release              - https://api.foo.com
+ *   https://api.foo.com/api/v1/android-signing/provision/prepare    - https://api.foo.com
+ *   https://api.foo.com/api/v1/android-signing                      - https://api.foo.com
+ *   https://api.foo.com/api/v1/appstore/applications/x/builds       - https://api.foo.com
+ *   https://api.foo.com/api/v1/appstore/releases/uuid/status        - https://api.foo.com
+ *   https://api.foo.com/                                            - https://api.foo.com
  */
 export function deriveBaseApiUrl(url) {
     if (!url) return null;
     return String(url)
         .replace(
             /\/api\/v1\/android-signing\/?(release|provision\/?(prepare|commit)?)?\/?$/i,
+            ''
+        )
+        .replace(
+            /\/api\/v1\/appstore(?:\/applications\/[^/]+\/builds|\/applications\/[^/]+\/releases|\/releases\/[^/]+\/status)?\/?$/i,
             ''
         )
         .replace(/\/+$/, '');

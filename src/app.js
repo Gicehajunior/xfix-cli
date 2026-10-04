@@ -27,6 +27,8 @@ import {
     ANDROID_ENV,
     ANDROID_HEADERS,
     DEFAULT_ANDROID_AUTH,
+    APPSTORE_PATHS,
+    APPSTORE_DEFAULTS,
     HTTP_DEFAULTS,
     USER_AGENTS,
     DEPLOY_HEADERS,
@@ -1072,6 +1074,477 @@ class App {
     }
 
     /**
+     * Compute the sha256 of a file as "sha256:<hex>". The prefix is
+     * required by the storefront manifest validator.
+     */
+    async sha256File(filePath) {
+        const { createHash } = await import('node:crypto');
+
+        return new Promise((resolve, reject) => {
+            const hash = createHash('sha256');
+            const stream = fs.createReadStream(filePath);
+
+            stream.on('data',  (chunk) => hash.update(chunk));
+            stream.on('error', reject);
+            stream.on('end',   () => resolve('sha256:' + hash.digest('hex')));
+        });
+    }
+
+    /**
+     * Read version_name / version_code from pubspec.yaml.
+     * Format: `version: 1.0.0+1` → { version_name: '1.0.0', version_code: 1 }
+     */
+    async readPubspecVersion(projectDir = '.') {
+        const p = path.join(this.ROOT, projectDir, 'pubspec.yaml');
+        if (!await fs.pathExists(p)) return { version_name: '0.0.0', version_code: 1 };
+
+        const match = (await fs.readFile(p, 'utf8')).match(/^version:\s*(\S+)/m);
+        if (!match) return { version_name: '0.0.0', version_code: 1 };
+
+        const [name, code] = match[1].split('+');
+        return {
+            version_name: name,
+            version_code: parseInt(code || '1', 10),
+        };
+    }
+
+    /**
+     * Read applicationId / minSdk / targetSdk from the Flutter Android
+     * build.gradle or build.gradle.kts.
+     */
+    async readAndroidGradle(projectDir = '.') {
+        const candidates = [
+            path.join(this.ROOT, projectDir, 'android', 'app', 'build.gradle'),
+            path.join(this.ROOT, projectDir, 'android', 'app', 'build.gradle.kts'),
+        ];
+
+        const present = await Promise.all(candidates.map(p => fs.pathExists(p)));
+        const idx = present.findIndex(Boolean);
+        if (idx === -1) return {};
+
+        const raw = await fs.readFile(candidates[idx], 'utf8');
+
+        return {
+            package_name: raw.match(/applicationId\s*[=:]\s*["']([^"']+)/)?.[1] ?? null,
+            min_sdk:      raw.match(/minSdk(?:Version)?\s*[=:]?\s*(\d+)/)?.[1]  ?? null,
+            target_sdk:   raw.match(/targetSdk(?:Version)?\s*[=:]?\s*(\d+)/)?.[1] ?? null,
+        };
+    }
+
+    /**
+     * Read commit_sha / git_ref / git_repo from the working tree. Any
+     * missing piece is null rather than fatal — the server accepts null.
+     */
+    async readGitInfo() {
+        try {
+            const [commit_sha, git_ref] = await Promise.all([
+                this.git.revparse(['HEAD']).then(s => s.trim()),
+                this.git.revparse(['--abbrev-ref', 'HEAD']).then(s => s.trim()),
+            ]);
+
+            let git_repo = null;
+            try {
+                const remotes = await this.git.getRemotes(true);
+                git_repo = remotes?.[0]?.refs?.fetch ?? null;
+            } catch { /* no remote configured */ }
+
+            return { commit_sha, git_ref, git_repo };
+        } catch {
+            return {};
+        }
+    }
+
+    /**
+     * Extract the SHA-256 fingerprint of the APK's signing certificate.
+     * Used purely for the storefront manifest — verification is done
+     * server-side against the keystore on record.
+     */
+    async signingCertificateSha256(apkPath) {
+        const apksigner = await this.findAndroidBuildTool('apksigner');
+        if (!apksigner) return null;
+
+        try {
+            const out = execSync(
+                `"${apksigner}" verify --print-certs "${apkPath}"`,
+                { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+            );
+
+            const match = out.match(/SHA-256 digest:\s*([0-9a-f:]+)/i);
+            return match ? match[1].replace(/:/g, '').toLowerCase() : null;
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Resolve the app store config block.
+     *
+     * Reads `appstore.*` first, falls back to `android.*` (both
+     * namespaces share the API URL and auth shape).
+     */
+    async getAppstoreConfig() {
+        const raw = await this.getRawConfig();
+        const a = raw.android  || {};
+        const s = raw.appstore || {};
+
+        const identifier =
+            process.env[ANDROID_ENV.appId] ||
+            s.appId || a.appId || null;
+
+        let apiUrl =
+            process.env[ANDROID_ENV.apiUrl] ||
+            s.apiUrl || a.apiUrl ||
+            DEFAULT_ANDROID_API_URL;
+
+        apiUrl = deriveBaseApiUrl(apiUrl) || apiUrl;
+        apiUrl = apiUrl.replace(/\/+$/, '');
+
+        return {
+            identifier,
+            apiUrl,
+            auth:        s.auth    || a.auth    || DEFAULT_ANDROID_AUTH,
+            channel:     process.env[ANDROID_ENV.channel]
+                      || s.channel || a.channel
+                      || APPSTORE_DEFAULTS.channel,
+            timeout:     s.timeout ?? a.timeout ?? APPSTORE_DEFAULTS.timeout,
+            releaseBody: s.releaseBody || a.releaseBody || {},
+        };
+    }
+
+    /**
+     * Resolve auth headers, wrapping the failure with an appstore-aware
+     * hint so third-party users know which env vars to set.
+     */
+    _resolveAppstoreAuth(auth) {
+        const headers = { 'Accept': HTTP_DEFAULTS.accept };
+        try {
+            Object.assign(headers, this._resolveAuthHeaders(auth));
+        } catch (err) {
+            throw new Error(
+                `Appstore auth resolution failed: ${err.message}\n` +
+                `   Export ${ANDROID_ENV.appId} and ${ANDROID_ENV.apiKey}, then re-run.`
+            );
+        }
+        return headers;
+    }
+
+    /**
+     * Compose the build manifest the server expects.
+     *
+     * `artifacts` is an array of prepared entries:
+     *   { path, type, platform, architecture, hash, certSha, signedAt, mime }
+     */
+    async buildBuildManifest(artifacts, opts = {}) {
+        const [git, pubspec, gradle, builtByName] = await Promise.all([
+            this.readGitInfo(),
+            this.readPubspecVersion(opts.projectDir),
+            this.readAndroidGradle(opts.projectDir),
+            this.git.raw(['config', 'user.name']).then(s => s.trim()).catch(() => null),
+        ]);
+
+        const primary = artifacts[0];
+
+        return {
+            version_name:  opts.versionName  || pubspec.version_name,
+            version_code:  opts.versionCode  || pubspec.version_code,
+            build_hash:    primary.hash,
+            channel_slug:  opts.channel      || APPSTORE_DEFAULTS.channel,
+
+            commit_sha:    git.commit_sha ?? null,
+            git_ref:       git.git_ref    ?? null,
+            git_repo:      git.git_repo   ?? null,
+
+            package_name:  gradle.package_name ?? null,
+            min_sdk:       gradle.min_sdk      ?? null,
+            target_sdk:    gradle.target_sdk   ?? null,
+            display_name:  opts.displayName    ?? null,
+            environment:   opts.environment    ?? 'production',
+
+            built_by_name:   opts.builtByName || builtByName || null,
+            builder_machine: os.hostname(),
+            cli_version:     '1.2.0',
+            built_at:        new Date().toISOString(),
+            source:          'xfix_cli',
+
+            changelog:              opts.changelog     ?? null,
+            release_notes_public:   opts.releaseNotes  ?? null,
+            release_notes_internal: opts.internalNotes ?? null,
+            metadata:               opts.metadata      ?? null,
+
+            artifacts: artifacts.map(a => ({
+                platform:                   a.platform,
+                artifact_type:              a.type,
+                architecture:               a.architecture ?? null,
+                file_name:                  path.basename(a.path),
+                file_hash:                  a.hash,
+                disk:                       'local',
+                signing_key_alias:          opts.keyAlias ?? null,
+                signing_certificate_sha256: a.certSha    ?? null,
+                signed_at:                  a.signedAt   ?? null,
+                mime_type:                  a.mime
+                    ?? (a.type === 'apk'
+                        ? 'application/vnd.android.package-archive'
+                        : 'application/octet-stream'),
+            })),
+        };
+    }
+
+    async uploadBuild(identifier, manifest, artifactPaths) {
+        const cfg = await this.getAppstoreConfig();
+
+        if (!identifier) {
+            throw new Error(
+                'No app identifier configured.\n' +
+                `   Set android.appId in .xfixrc.json or export ${ANDROID_ENV.appId}.`
+            );
+        }
+
+        if (artifactPaths.length > APPSTORE_DEFAULTS.maxArtifacts) {
+            throw new Error(
+                `Too many artifacts (${artifactPaths.length}). ` +
+                `The server accepts up to ${APPSTORE_DEFAULTS.maxArtifacts}.`
+            );
+        }
+
+        const url = joinUrl(
+            cfg.apiUrl,
+            APPSTORE_PATHS.builds.replace(
+                '{identifier}',
+                encodeURIComponent(identifier)
+            )
+        );
+
+        const headers = {
+            ...this._resolveAppstoreAuth(cfg.auth),
+            'User-Agent': USER_AGENTS.appstore,
+        };
+
+        const form = new FormData();
+        form.append('manifest', JSON.stringify(manifest));
+
+        for (let i = 0; i < artifactPaths.length; i++) {
+            const buf  = await fs.readFile(artifactPaths[i]);
+            const blob = new Blob([buf]);
+            form.append(`artifact_${i}`, blob, path.basename(artifactPaths[i]));
+        }
+
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), cfg.timeout);
+
+        try {
+            this.log(`Uploading build to ${url}...`, true, 'upload');
+
+            const res = await fetch(url, {
+                method: 'POST',
+                headers,
+                body: form,
+                signal: controller.signal,
+            });
+            clearTimeout(timer);
+
+            const json = await res.json().catch(() => ({}));
+
+            if (!res.ok || json.success === false) {
+                throw new Error(
+                    `Build upload failed: ${res.status} ${res.statusText}` +
+                    (json.message ? ` — ${json.message}` : '')
+                );
+            }
+
+            this.log(
+                `Build uploaded: ${json.data?.uuid ?? '<unknown>'}`,
+                false,
+                'success'
+            );
+            return json.data;
+        } catch (err) {
+            clearTimeout(timer);
+            if (err.name === 'AbortError') {
+                throw new Error(`Build upload timed out after ${cfg.timeout}ms`);
+            }
+            throw err;
+        }
+    }
+
+    async createRelease(identifier, payload) {
+        const cfg = await this.getAppstoreConfig();
+
+        const url = joinUrl(
+            cfg.apiUrl,
+            APPSTORE_PATHS.releases.replace(
+                '{identifier}',
+                encodeURIComponent(identifier)
+            )
+        );
+
+        const headers = {
+            ...this._resolveAppstoreAuth(cfg.auth),
+            'Content-Type': HTTP_DEFAULTS.contentType,
+            'User-Agent':   USER_AGENTS.appstore,
+        };
+
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), cfg.timeout);
+
+        try {
+            const res = await fetch(url, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(payload),
+                signal: controller.signal,
+            });
+            clearTimeout(timer);
+
+            const json = await res.json().catch(() => ({}));
+
+            if (!res.ok || json.success === false) {
+                throw new Error(
+                    `Release creation failed: ${res.status} ${res.statusText}` +
+                    (json.message ? ` — ${json.message}` : '')
+                );
+            }
+
+            return json.data;
+        } catch (err) {
+            clearTimeout(timer);
+            if (err.name === 'AbortError') {
+                throw new Error(`Release creation timed out after ${cfg.timeout}ms`);
+            }
+            throw err;
+        }
+    }
+
+    async updateReleaseStatus(uuid, payload) {
+        const cfg = await this.getAppstoreConfig();
+
+        const url = joinUrl(
+            cfg.apiUrl,
+            APPSTORE_PATHS.releaseStatus.replace('{uuid}', encodeURIComponent(uuid))
+        );
+
+        const headers = {
+            ...this._resolveAppstoreAuth(cfg.auth),
+            'Content-Type': HTTP_DEFAULTS.contentType,
+            'User-Agent':   USER_AGENTS.appstore,
+        };
+
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), cfg.timeout);
+
+        try {
+            const res = await fetch(url, {
+                method: 'PATCH',
+                headers,
+                body: JSON.stringify(payload),
+                signal: controller.signal,
+            });
+            clearTimeout(timer);
+
+            const json = await res.json().catch(() => ({}));
+
+            if (!res.ok || json.success === false) {
+                throw new Error(
+                    `Release status update failed: ${res.status} ${res.statusText}` +
+                    (json.message ? ` — ${json.message}` : '')
+                );
+            }
+
+            return json.data;
+        } catch (err) {
+            clearTimeout(timer);
+            if (err.name === 'AbortError') {
+                throw new Error(`Release status update timed out after ${cfg.timeout}ms`);
+            }
+            throw err;
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // App store — orchestration
+    // ─────────────────────────────────────────────────────────
+    /**
+     * High-level: hash the signed artifacts, compose the manifest,
+     * upload, and optionally release + publish.
+     *
+     * Returns `{ build, release }`. `release` is null when only
+     * `--deploy` was requested.
+     */
+    async appstoreDeploy(artifactPaths, opts = {}) {
+        const cfg = await this.getAppstoreConfig();
+
+        if (!cfg.identifier) {
+            this.log(
+                'No app_id configured — skipping app store upload.\n' +
+                `   Set android.appId in .xfixrc.json or export ${ANDROID_ENV.appId}.`,
+                false,
+                'warn'
+            );
+            return null;
+        }
+
+        // Prepare artifacts with hash + cert fingerprint
+        const artifacts = [];
+        for (const p of artifactPaths) {
+            const ext      = path.extname(p).toLowerCase();
+            const type     = ext === '.aab' ? 'aab' : ext === '.apk' ? 'apk' : 'zip';
+            const platform = opts.platform
+                ?? (type === 'aab' || type === 'apk' ? 'android' : 'unknown');
+
+            artifacts.push({
+                path:         p,
+                type,
+                platform,
+                architecture: opts.architecture ?? null,
+                hash:         await this.sha256File(p),
+                certSha:      type === 'apk'
+                    ? await this.signingCertificateSha256(p)
+                    : null,
+                signedAt:     type === 'apk' ? new Date().toISOString() : null,
+                mime:         null,
+            });
+        }
+
+        const manifest = await this.buildBuildManifest(artifacts, {
+            ...opts,
+            channel: opts.channel || cfg.channel,
+        });
+
+        const build = await this.uploadBuild(cfg.identifier, manifest, artifactPaths);
+
+        if (!opts.release && !opts.publish) {
+            return { build, release: null };
+        }
+
+        const releasePayload = {
+            build_uuid:           build.uuid,
+            channel_slug:         opts.channel      || cfg.channel,
+            title:                opts.title        || cfg.releaseBody.title || undefined,
+            changelog:            opts.changelog    ?? cfg.releaseBody.changelog,
+            release_notes_public: opts.releaseNotes ?? cfg.releaseBody.release_notes_public,
+            rollout_percentage:   opts.rollout      ?? 100,
+            is_mandatory:         !!opts.mandatory,
+            is_prerelease:        !!opts.prerelease,
+            publish:              !!opts.publish,
+            scheduled_at:         opts.scheduledAt ?? null,
+            platforms:            opts.platforms   ?? null,
+        };
+
+        const release = await this.createRelease(cfg.identifier, releasePayload);
+
+        if (opts.publish && release.status === 'draft') {
+            this.log(
+                `Release created as draft — channel '${releasePayload.channel_slug}' requires review.`,
+                false,
+                'warn'
+            );
+        } else if (opts.publish) {
+            this.log(`Release ${release.uuid} published.`, false, 'success');
+        }
+
+        return { build, release };
+    }
+
+    /**
      * Verify an APK signature via apksigner.
      */
     async verifyApk(apkPath) {
@@ -1125,16 +1598,20 @@ class App {
      * Locate APK files produced by a Flutter build.
      */
     async findFlutterApks(flavor) {
-        const dir = path.join(this.ROOT, 'build', 'app', 'outputs', 'flutter-apk');
-        if (!await fs.pathExists(dir)) return [];
+		const dir = path.join(this.ROOT, 'build', 'app', 'outputs', 'flutter-apk');
+		if (!await fs.pathExists(dir)) return [];
 
-        const entries = await fs.readdir(dir);
-        const prefix = flavor ? `app-${flavor}-` : 'app-';
+		const entries = await fs.readdir(dir);
+		const prefix = flavor ? `app-${flavor}-` : 'app-';
 
-        return entries
-            .filter(f => f.startsWith(prefix) && f.endsWith('.apk'))
-            .map(f => path.join(dir, f));
-    }
+		return entries
+			.filter(f =>
+				f.startsWith(prefix) &&
+				f.endsWith('.apk') &&
+				!f.includes('-debug')          // ← exclude debug builds
+			)
+			.map(f => path.join(dir, f));
+	}
 
     /**
      * Locate the AAB produced by a Flutter build.
@@ -1164,7 +1641,7 @@ class App {
         if (opts.verbose) args.push('-v');
 
         await this.runFlutter(args);
-        return this.findFlutterApks(opts.flavor);
+        return await this.findFlutterApks(opts.flavor);
     }
 
     /**
@@ -1177,7 +1654,7 @@ class App {
         if (opts.verbose) args.push('-v');
 
         await this.runFlutter(args);
-        return this.findFlutterAab(opts.flavor);
+        return await this.findFlutterAab(opts.flavor);
     }
 
     /**
