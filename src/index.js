@@ -4,6 +4,11 @@ import dotenv from 'dotenv';
 import fs from 'fs-extra';
 import path from 'path';
 
+import {
+    ANDROID_ENV,
+    DEFAULT_ANDROID_API_URL,
+} from './config/index.js';
+
 dotenv.config();
 
 class CliService {
@@ -17,7 +22,7 @@ class CliService {
     }
 
     /**
-     * Load configuration from .xfixrc.json
+     * Load configuration from .xfixrc.json.
      *
      * Tolerant — a missing file or a deploy-less config is fine. Build,
      * keystore and flutter commands don't need any of it. Validation is
@@ -27,7 +32,6 @@ class CliService {
         try {
             const configPath = path.join(process.cwd(), '.xfixrc.json');
 
-            // No config file → build-only project
             if (!fs.existsSync(configPath)) {
                 this.config = {};
                 this.distributions = [];
@@ -37,28 +41,19 @@ class CliService {
             const configContent = fs.readFileSync(configPath, 'utf8');
             this.config = JSON.parse(configContent);
 
-            // Multi-distribution mode
             if (this.config.distributions && Object.keys(this.config.distributions).length > 0) {
                 this.distributions = Object.entries(this.config.distributions).map(([name, config]) => ({
                     name,
-                    ...config
+                    ...config,
                 }));
-            }
-            // Single-distribution mode (only if it actually looks like a deploy config)
-            else if (this.config.host && this.config.username) {
-                this.distributions = [{
-                    name: 'default',
-                    ...this.config
-                }];
-            }
-            // Config exists but has no deploy info (e.g. only android/flutter sections)
-            else {
+            } else if (this.config.host && this.config.username) {
+                this.distributions = [{ name: 'default', ...this.config }];
+            } else {
                 this.distributions = [];
             }
 
             return this.distributions;
         } catch (error) {
-            // Never exit here — deploy commands will surface the error later.
             console.error('⚠️  Failed to parse .xfixrc.json:', error.message);
             this.config = {};
             this.distributions = [];
@@ -92,7 +87,6 @@ class CliService {
             .description('XFIX CLI - Project Management & Deployment Tool')
             .version('1.0.0');
 
-        // Load config tolerantly — no exit, no validation
         this.loadConfig();
 
         this.setupRunCommand();
@@ -106,14 +100,13 @@ class CliService {
         this.setupKeystoreCommand();
         this.setupFlutterCommand();
 
-        // Handle default help
         this.program.on('--help', () => {
             this.displayHelp();
         });
     }
 
     /**
-     * Manage multiple distributions
+     * Manage multiple distributions.
      */
     setupMultiDistCommand() {
         const multiCmd = this.program
@@ -244,7 +237,7 @@ class CliService {
                     includeUnstaged: options.includeUnstaged ? true : false,
                     includeUntracked: options.untracked !== false,
                     stagedOnly: options.stagedOnly ? true : false,
-                    fullDeployment: options.full ? true : false
+                    fullDeployment: options.full ? true : false,
                 };
 
                 await this.handleRunCommand(runOptions);
@@ -381,7 +374,7 @@ class CliService {
     }
 
     /**
-     * Build commands (Flutter + Android signing)
+     * Build commands (Flutter + Android signing).
      */
     setupBuildCommand() {
         const buildCmd = this.program
@@ -443,7 +436,7 @@ class CliService {
     }
 
     /**
-     * Keystore management (JKS)
+     * Keystore management (JKS).
      */
     setupKeystoreCommand() {
         const ksCmd = this.program
@@ -460,7 +453,7 @@ class CliService {
             .option('--dname <dname>', 'Distinguished name (override — default comes from the server)')
             .option('--storepass <password>', 'Keystore password (or ANDROID_KEYSTORE_PASSWORD)')
             .option('--validity <days>', 'Validity in days', '10000')
-            .option('--api-url <url>', 'Override provisioningApi.url from config')
+            .option('--api-url <url>', 'Override android.apiUrl from .xfixrc.json (base URL only)')
             .option('--skip-upload', 'Only generate the .jks locally, do not register')
             .option('--force', 'Overwrite existing .jks')
             .option('--verbose', 'Verbose output')
@@ -503,7 +496,7 @@ class CliService {
     }
 
     /**
-     * Raw Flutter passthrough: xfix flutter <anything>
+     * Raw Flutter passthrough: xfix flutter <anything>.
      */
     setupFlutterCommand() {
         this.program
@@ -519,14 +512,13 @@ class CliService {
     }
 
     /**
-     * Handle the main 'run' command
+     * Handle the main 'run' command.
      */
     async handleRunCommand(options) {
         try {
             const parsedOptions = this.parseRunOptions(options);
             this.validateOptions(parsedOptions);
 
-            // Only require valid distributions when we're about to deploy
             if (parsedOptions.deploy) {
                 this.validateDistributions();
             }
@@ -565,8 +557,6 @@ class CliService {
 
     /**
      * Get target distributions based on options.
-     * Throws a clear error for build-only projects instead of warning about
-     * an empty distribution list.
      */
     getTargetDistributions(options) {
         if (this.distributions.length === 0) {
@@ -604,7 +594,7 @@ class CliService {
     }
 
     /**
-     * Handle multi-distribution deployment
+     * Handle multi-distribution deployment.
      */
     async handleMultiDistributionDeploy(distributions, options) {
         console.log(`\n🌐 Multi-Distribution Deployment`);
@@ -620,18 +610,12 @@ class CliService {
                 console.log('─'.repeat(30));
 
                 await this.deployToDistribution(dist, options);
-                results.push({
-                    distribution: dist.name,
-                    success: true
-                });
+                results.push({ distribution: dist.name, success: true });
 
                 console.log(`✅ ${dist.name} completed successfully`);
             } catch (error) {
                 console.error(`❌ ${dist.name} failed:`, error.message);
-                errors.push({
-                    distribution: dist.name,
-                    error: error
-                });
+                errors.push({ distribution: dist.name, error });
 
                 if (distributions.length > 1) {
                     const shouldContinue = await this.promptContinue(
@@ -649,7 +633,7 @@ class CliService {
     }
 
     /**
-     * Handle listing distributions with marker status
+     * Handle listing distributions with marker status.
      */
     async handleListDistributions(options) {
         console.log('\n📋 Configured Distributions');
@@ -673,7 +657,7 @@ class CliService {
             if (showMarkers) {
                 const app = new App({
                     distributionName: dist.name,
-                    verbose: false
+                    verbose: false,
                 });
 
                 try {
@@ -708,7 +692,7 @@ class CliService {
     }
 
     /**
-     * Handle resetting deployment marker
+     * Handle resetting deployment marker.
      */
     async handleResetMarker(name, options) {
         const distribution = this.distributions.find(d => d.name === name);
@@ -723,7 +707,7 @@ class CliService {
 
         const app = new App({
             distributionName: distribution.name,
-            verbose: options.verbose || false
+            verbose: options.verbose || false,
         });
 
         try {
@@ -755,7 +739,7 @@ class CliService {
     }
 
     /**
-     * Handle showing deployment status for all distributions
+     * Handle showing deployment status for all distributions.
      */
     async handleDistributionsStatus(options) {
         console.log('\n📊 Deployment Status');
@@ -773,7 +757,7 @@ class CliService {
 
             const app = new App({
                 distributionName: dist.name,
-                verbose: options.verbose || false
+                verbose: options.verbose || false,
             });
 
             try {
@@ -789,7 +773,7 @@ class CliService {
                             includeUnstaged: false,
                             includeUntracked: false,
                             stagedOnly: false,
-                            includeCommitted: true
+                            includeCommitted: true,
                         });
                         console.log(`   Changes:     ${changes.length} files`);
                     }
@@ -815,7 +799,7 @@ class CliService {
     }
 
     /**
-     * Handle cleaning up orphaned markers
+     * Handle cleaning up orphaned markers.
      */
     async handleCleanMarkers(options) {
         console.log('\n🧹 Cleaning Orphaned Markers');
@@ -860,7 +844,7 @@ class CliService {
     }
 
     /**
-     * Deploy to a single distribution with marker handling
+     * Deploy to a single distribution with marker handling.
      */
     async handleSingleDistributionDeploy(distribution, options) {
         console.log(`\n🚀 Deploying to: ${distribution.name}`);
@@ -873,7 +857,7 @@ class CliService {
             console.log(`🔄 Resetting deployment marker for ${distribution.name}...`);
             const app = new App({
                 distributionName: distribution.name,
-                verbose: options.verbose || false
+                verbose: options.verbose || false,
             });
             await app.resetDeployMarker();
             console.log('   Marker reset for full deployment\n');
@@ -891,7 +875,7 @@ class CliService {
     }
 
     /**
-     * Deploy to a single distribution
+     * Deploy to a single distribution.
      */
     async deployToDistribution(distribution, options) {
         const mergedOptions = this.mergeConfigWithOptions(distribution, options);
@@ -921,7 +905,7 @@ class CliService {
     }
 
     /**
-     * Merge distribution config with command options
+     * Merge distribution config with command options.
      */
     mergeConfigWithOptions(distribution, options) {
         return {
@@ -978,14 +962,14 @@ class CliService {
             services: options.services || [],
             type: options.type || 'general',
             distributionName: distribution.name,
-            distributionIndex: this.distributions.indexOf(distribution)
+            distributionIndex: this.distributions.indexOf(distribution),
         };
     }
 
     /**
-     * Handle distribution list (legacy)
+     * Handle distribution list (legacy).
      */
-    handleListDistributions() {
+    handleListDistributionsLegacy() {
         console.log('\n📋 Configured Distributions');
         console.log('═'.repeat(50));
 
@@ -1010,7 +994,7 @@ class CliService {
     }
 
     /**
-     * Handle deploying to specific distribution
+     * Handle deploying to specific distribution.
      */
     async handleDistributionDeploy(name, options) {
         this.validateDistributions();
@@ -1026,7 +1010,7 @@ class CliService {
     }
 
     /**
-     * Handle deploy to all distributions
+     * Handle deploy to all distributions.
      */
     async handleDeployAll(options) {
         this.validateDistributions();
@@ -1034,7 +1018,7 @@ class CliService {
     }
 
     /**
-     * Handle validating a distribution
+     * Handle validating a distribution.
      */
     async handleValidateDistribution(name, options) {
         const distribution = this.distributions.find(d => d.name === name);
@@ -1053,7 +1037,7 @@ class CliService {
         try {
             const app = new App({
                 ...distribution,
-                verbose: options.verbose || false
+                verbose: options.verbose || false,
             });
 
             await app.testConnection();
@@ -1065,7 +1049,7 @@ class CliService {
     }
 
     /**
-     * Handle obfuscation-only
+     * Handle obfuscation-only.
      */
     async handleObfuscationOnly(options) {
         try {
@@ -1078,7 +1062,7 @@ class CliService {
                 obfuscateJs: options.obfuscateJs || false,
                 obfuscatePhp: options.obfuscatePhp || false,
                 deploy: false,
-                secure: false
+                secure: false,
             };
 
             console.log('\n🔒 XFIX Obfuscation:');
@@ -1097,7 +1081,7 @@ class CliService {
     }
 
     /**
-     * Handle obfuscate command
+     * Handle obfuscate command.
      */
     async handleObfuscateCommand(options) {
         const obfuscateOptions = {
@@ -1109,14 +1093,14 @@ class CliService {
             obfuscateJs: options.all || options.js || (!options.js && !options.php),
             obfuscatePhp: options.all || options.php || (!options.js && !options.php),
             deploy: false,
-            secure: false
+            secure: false,
         };
 
         await this.handleObfuscationOnly(obfuscateOptions);
     }
 
     /**
-     * Handle revert command
+     * Handle revert command.
      */
     async handleRevertCommand(options) {
         try {
@@ -1146,7 +1130,7 @@ class CliService {
     }
 
     /**
-     * Handle controller generation
+     * Handle controller generation.
      */
     async handleControllerGeneration(controllers) {
         try {
@@ -1155,7 +1139,7 @@ class CliService {
             const applicationService = new App({
                 verbose: true,
                 generateControllers: true,
-                controllers: controllers
+                controllers,
             });
 
             await applicationService.generateControllers(controllers);
@@ -1167,7 +1151,7 @@ class CliService {
     }
 
     /**
-     * Handle service generation
+     * Handle service generation.
      */
     async handleServiceGeneration(services, options) {
         try {
@@ -1189,8 +1173,8 @@ class CliService {
             const applicationService = new App({
                 verbose: options.verbose || false,
                 generateServices: true,
-                services: services,
-                serviceType: serviceType
+                services,
+                serviceType,
             });
 
             await applicationService.generateServices(services, serviceType);
@@ -1202,7 +1186,7 @@ class CliService {
     }
 
     /**
-     * Parse and normalize run options
+     * Parse and normalize run options.
      */
     parseRunOptions(options) {
         const shouldDeploy = options.deploy || false;
@@ -1240,15 +1224,15 @@ class CliService {
             jsSrcPath: options.jsSrc || 'public/js',
             jsDestPath: options.jsDest || 'public/orig',
             generateControllers: controllers.length > 0,
-            controllers: controllers,
+            controllers,
             generateServices: services.length > 0,
             type: options.type || 'general',
-            services: services
+            services,
         };
     }
 
     /**
-     * Validate conflicting or invalid options
+     * Validate conflicting or invalid options.
      */
     validateOptions(options) {
         if (options.deploy && options.generateControllers && options.generateServices) {
@@ -1288,7 +1272,7 @@ class CliService {
     }
 
     /**
-     * Database command handlers
+     * Database command handlers.
      */
     async handleDbMigrateCommand(options) {
         try {
@@ -1298,7 +1282,7 @@ class CliService {
             const migrationOptions = {
                 step: options.step || null,
                 dryRun: options.dryRun || false,
-                verbose: options.verbose || false
+                verbose: options.verbose || false,
             };
 
             if (migrationOptions.dryRun) {
@@ -1332,7 +1316,7 @@ class CliService {
                 step: options.step || 1,
                 target: options.target || null,
                 dryRun: options.dryRun || false,
-                verbose: options.verbose || false
+                verbose: options.verbose || false,
             };
 
             if (rollbackOptions.dryRun) {
@@ -1368,11 +1352,11 @@ class CliService {
             console.log(`   Language: ${lang.toUpperCase()}`);
 
             const createOptions = {
-                name: name,
+                name,
                 table: options.table || null,
                 template: options.template || 'create',
-                lang: lang,
-                verbose: options.verbose || false
+                lang,
+                verbose: options.verbose || false,
             };
 
             if (!this.applicationService) {
@@ -1424,7 +1408,7 @@ class CliService {
             const resetOptions = {
                 seed: options.seed || false,
                 force: options.force || false,
-                verbose: options.verbose || false
+                verbose: options.verbose || false,
             };
 
             if (!resetOptions.force && process.env.NODE_ENV === 'production') {
@@ -1457,8 +1441,8 @@ class CliService {
             }
 
             const seederPath = await this.applicationService.createSeeder({
-                name: name,
-                verbose: options.verbose || false
+                name,
+                verbose: options.verbose || false,
             });
 
             console.log(`\n✅ Seeder created successfully:`);
@@ -1481,7 +1465,7 @@ class CliService {
             const seedOptions = {
                 seederClass: options.class || null,
                 force: options.force || false,
-                verbose: options.verbose || false
+                verbose: options.verbose || false,
             };
 
             if (!seedOptions.force && process.env.NODE_ENV === 'production') {
@@ -1505,7 +1489,7 @@ class CliService {
     }
 
     /**
-     * xfix build apk
+     * xfix build apk.
      */
     async handleBuildApk(options) {
         try {
@@ -1520,7 +1504,7 @@ class CliService {
                     flavor: options.flavor,
                     target: options.target,
                     splitPerAbi: options.splitPerAbi,
-                    verbose: options.verbose || false
+                    verbose: options.verbose || false,
                 });
 
                 if (!apkPaths.length) {
@@ -1546,7 +1530,7 @@ class CliService {
                 await app.signApk(apk, {
                     keystorePath: options.keystore,
                     keyAlias: options.alias,
-                    verbose: options.verbose || false
+                    verbose: options.verbose || false,
                 });
             }
 
@@ -1557,7 +1541,7 @@ class CliService {
     }
 
     /**
-     * xfix build aab
+     * xfix build aab.
      */
     async handleBuildAab(options) {
         try {
@@ -1568,7 +1552,7 @@ class CliService {
             const aabPath = await app.buildFlutterAab({
                 flavor: options.flavor,
                 target: options.target,
-                verbose: options.verbose || false
+                verbose: options.verbose || false,
             });
 
             if (!aabPath) {
@@ -1600,7 +1584,7 @@ class CliService {
                 flavor: options.flavor,
                 target: options.target,
                 codesign: options.codesign !== false,
-                verbose: options.verbose || false
+                verbose: options.verbose || false,
             });
             console.log('\n✅ iOS build completed\n');
         } catch (err) {
@@ -1651,7 +1635,7 @@ class CliService {
         try {
             const app = new App({});
             const storepass = options.storepass
-                || process.env.ANDROID_KEYSTORE_PASSWORD
+                || process.env[ANDROID_ENV.keystorePassword]
                 || await this.promptPassword('Keystore password: ');
 
             const keypass = options.keypass || storepass;
@@ -1677,22 +1661,22 @@ class CliService {
                 dname: options.dname,
                 validity: options.validity,
                 keyalg: options.keyalg,
-                keysize: options.keysize
+                keysize: options.keysize,
             });
 
             console.log(`\n✅ Keystore created: ${out}`);
             console.log(`   Alias: ${options.alias}`);
             console.log('\n💡 Add to .xfixrc.json (android.keystorePath) or set env vars:');
-            console.log(`   ANDROID_KEYSTORE_PATH=${path.relative(process.cwd(), out)}`);
-            console.log('   ANDROID_KEYSTORE_PASSWORD=<your password>');
-            console.log(`   ANDROID_KEY_ALIAS=${options.alias}`);
+            console.log(`   ${ANDROID_ENV.keystorePath}=${path.relative(process.cwd(), out)}`);
+            console.log(`   ${ANDROID_ENV.keystorePassword}=<your password>`);
+            console.log(`   ${ANDROID_ENV.keyAlias}=${options.alias}`);
         } catch (err) {
             this.handleError(err, false);
         }
     }
 
     /**
-     * xfix keystore provision
+     * xfix keystore provision.
      *
      * Two-phase flow:
      *   1. Ask the server for the DN / alias / package name (per-app, and the
@@ -1709,17 +1693,17 @@ class CliService {
     async handleKeystoreProvision(options) {
         try {
             const app = new App({ verbose: options.verbose || false });
-            
+
             const cfg = await app.getAndroidConfig();
 
-            const appId = options.appId || cfg.appId || process.env.XFIX_APP_ID;
+            const appId = options.appId || cfg.appId || process.env[ANDROID_ENV.appId];
             if (!appId) {
                 throw new Error(
                     'No application ID specified.\n' +
                     '   Provide one of:\n' +
                     '   • --app-id <id> on the command line\n' +
                     '   • android.appId in .xfixrc.json\n' +
-                    '   • XFIX_APP_ID in .env'
+                    `   • ${ANDROID_ENV.appId} in .env`
                 );
             }
 
@@ -1733,17 +1717,16 @@ class CliService {
 
             const out = path.resolve(outPath);
 
-            // Step 1: Ask the server for the DN / alias / package
             console.log('\n📡 Step 1/4 — Preparing provisioning');
             console.log('─'.repeat(40));
-            console.log(`   App ID: ${appId}`);
+            console.log(`   App ID:   ${appId}`);
+            console.log(`   Base URL: ${cfg.apiUrl}`);
 
             const prep = await app.prepareSigningProvision({
                 appId,
-                apiUrl: options.apiUrl
+                apiUrl: options.apiUrl,
             });
 
-            // Flags override server-supplied values when present
             const dname = options.dname || prep.dname;
             const alias = options.alias || prep.keyAlias || 'release';
             const pkg = options.packageName || prep.packageName;
@@ -1752,9 +1735,8 @@ class CliService {
             console.log(`   Alias:  ${alias}`);
             if (pkg) console.log(`   Pkg:    ${pkg}`);
 
-            // Step 2: Generate the keystore locally
             let storepass;
-            if (prep.passwordOwner === 'admin') { 
+            if (prep.passwordOwner === 'admin') {
                 storepass = prep.keystorePassword;
 
                 if (!storepass) {
@@ -1776,13 +1758,13 @@ class CliService {
                 console.log('   Password: (managed by platform administrator)\n');
             } else {
                 storepass = options.storepass
-                    || process.env.ANDROID_KEYSTORE_PASSWORD
+                    || process.env[ANDROID_ENV.keystorePassword]
                     || await this.promptPassword('Keystore password: ');
 
                 if (!storepass) throw new Error('Keystore password is required');
                 if (storepass.length < 6) throw new Error('Keystore password must be at least 6 characters');
             }
-                        
+
             const exists = await fs.pathExists(out);
             if (exists && !options.force) {
                 console.log(`\n⚠️  ${out} already exists.`);
@@ -1804,12 +1786,11 @@ class CliService {
                 dname,
                 validity: options.validity,
                 keyalg: 'RSA',
-                keysize: 2048
+                keysize: 2048,
             });
 
             console.log(`   ✅ Created: ${path.relative(process.cwd(), out)}`);
 
-            // Step 3: Encode
             console.log('\n📦 Step 3/4 — Encoding keystore');
             console.log('─'.repeat(40));
 
@@ -1825,7 +1806,6 @@ class CliService {
                 return;
             }
 
-            // Step 4: Commit to server
             console.log('\n☁️  Step 4/4 — Committing to server');
             console.log('─'.repeat(40));
 
@@ -1835,7 +1815,7 @@ class CliService {
                 keystorePassword: prep.passwordOwner === 'admin' ? null : storepass,
                 keyAlias: alias,
                 packageName: pkg,
-                apiUrl: options.apiUrl
+                apiUrl: options.apiUrl,
             });
 
             console.log(`   ✅ Registered: ${result.appId}`);
@@ -1846,8 +1826,7 @@ class CliService {
             console.log('\n🎉 Provisioning complete\n');
             console.log('   Next steps:');
             console.log(`   1. Verify:   xfix keystore info --path ${path.relative(process.cwd(), out)}`);
-            console.log('   2. Test API: xfix keystore fetch-test --verbose');
-            console.log('   3. Build:    xfix build apk --verbose');
+            console.log('   2. Build:    xfix build apk --verbose');
             console.log('');
             console.log('   ⚠️  BACK UP the .jks now. Three locations:');
             console.log('      • Encrypted offline drive');
@@ -1865,7 +1844,7 @@ class CliService {
         try {
             const app = new App({});
             const storepass = options.storepass
-                || process.env.ANDROID_KEYSTORE_PASSWORD
+                || process.env[ANDROID_ENV.keystorePassword]
                 || await this.promptPassword('Keystore password: ');
 
             await app.showKeystoreInfo({ path: options.path, storepass });
@@ -1898,7 +1877,7 @@ class CliService {
         const rl = readline.createInterface({
             input: process.stdin,
             output: process.stdout,
-            terminal: true
+            terminal: true,
         });
 
         const stdin = process.stdin;
@@ -1922,7 +1901,7 @@ class CliService {
     }
 
     /**
-     * Display operation summary
+     * Display operation summary.
      */
     displayOperationSummary(options, distributionName = null) {
         console.log('\n🔧 XFIX Operations Summary:');
@@ -1992,7 +1971,7 @@ class CliService {
     }
 
     /**
-     * Display multi-distribution summary
+     * Display multi-distribution summary.
      */
     displayMultiDistributionSummary(results, errors) {
         console.log('\n📊 Multi-Distribution Deployment Summary');
@@ -2024,13 +2003,13 @@ class CliService {
     }
 
     /**
-     * Prompt user for confirmation
+     * Prompt user for confirmation.
      */
     async promptContinue(message) {
         const readline = await import('readline');
         const rl = readline.createInterface({
             input: process.stdin,
-            output: process.stdout
+            output: process.stdout,
         });
 
         return new Promise((resolve) => {
@@ -2042,7 +2021,7 @@ class CliService {
     }
 
     /**
-     * Display help information
+     * Display help information.
      */
     displayHelp() {
         console.log('\n📚 XFIX CLI Help');
@@ -2124,6 +2103,7 @@ class CliService {
         console.log('  build web               Build Flutter web bundle');
         console.log('  build doctor            Check build tool availability');
         console.log('  keystore provision      Generate + register a keystore with the server');
+        console.log(`                          (defaults to ${DEFAULT_ANDROID_API_URL})`);
         console.log('  keystore generate       Create a new JKS keystore locally (no server)');
         console.log('  keystore info           Inspect a keystore');
         console.log('  keystore verify <apk>   Verify APK signature');
@@ -2140,7 +2120,7 @@ class CliService {
     }
 
     /**
-     * Handle errors consistently
+     * Handle errors consistently.
      */
     handleError(err, verbose = false) {
         console.error('\n❌ Operation failed:', err.message);
@@ -2152,7 +2132,7 @@ class CliService {
     }
 
     /**
-     * Parse CLI arguments and execute
+     * Parse CLI arguments and execute.
      */
     parse() {
         if (process.argv.length <= 2) {
@@ -2164,7 +2144,7 @@ class CliService {
     }
 
     /**
-     * Run the CLI
+     * Run the CLI.
      */
     run() {
         this.parse();

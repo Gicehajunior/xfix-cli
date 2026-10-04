@@ -167,6 +167,63 @@ Use a `distributions` block to deploy to several servers from the same project.
 
 ### Flutter and Android signing configuration
 
+The preferred shape uses a single `android.apiUrl` base URL plus a shared `auth` block and an optional `releaseBody`:
+
+```json
+{
+  "android": {
+    "appId": "app_your_app_identifier",
+    "apiUrl": "https://api.xfixglobal.com",
+    "keystorePath": "android/app/release.jks",
+    "keyAlias": "release",
+
+    "auth": {
+      "headers": {
+        "XFIX-APP-ID":  { "env": "XFIX_APP_ID" },
+        "XFIX-API-KEY": { "env": "XFIX_API_KEY" }
+      }
+    },
+
+    "releaseBody": {
+      "project": "your-project-slug",
+      "environment": "production"
+    },
+
+    "timeout": 10000,
+    "retries": 2
+  },
+
+  "flutter": {
+    "projectDir": ".",
+    "flavor": null
+  }
+}
+```
+
+The `auth` block accepts several shapes (all optional, combinable):
+
+```json
+{ "type": "bearer", "tokenEnv": "XFIX_SECRETS_TOKEN" }
+{ "type": "basic",  "userEnv": "XFIX_USER", "passEnv": "XFIX_PASS" }
+{ "type": "header", "headerName": "X-API-Key", "tokenEnv": "XFIX_API_KEY" }
+{
+  "headers": {
+    "X-Tenant":      "acme",
+    "XFIX-APP-ID":   { "env": "XFIX_APP_ID" },
+    "XFIX-API-KEY":  { "env": "XFIX_API_KEY" },
+    "Authorization": { "template": "Token ${XFIX_API_KEY}" }
+  }
+}
+```
+
+- `{ "env": "NAME" }` reads the header value from the given environment variable. Missing values are a hard error.
+- `{ "template": "…" }` interpolates `${VAR}` placeholders from the environment. Missing values are a hard error.
+- Plain strings are sent as-is.
+
+**Base URL resolution order:** `android.apiUrl` → `XFIX_API_URL` → URL derived from a legacy `credentialsApi.url` / `provisioningApi.url` → `https://api.xfixglobal.com`. The path suffixes (`/api/v1/android-signing/release`, `/provision/prepare`, `/provision/commit`) are a fixed part of the API contract and are not configurable.
+
+**Legacy shape (still honoured):** if your config uses `credentialsApi` and `provisioningApi`, the CLI derives the base URL from the first non-empty `url`, and uses that block's `auth` and `body` as defaults when `android.auth` / `android.releaseBody` are absent.
+
 ```json
 {
   "android": {
@@ -185,9 +242,7 @@ Use a `distributions` block to deploy to several servers from the same project.
           "XFIX-API-KEY": { "env": "XFIX_API_KEY" }
         }
       },
-      "body": {
-        "project": "your-project-slug"
-      }
+      "body": { "project": "your-project-slug" }
     },
 
     "provisioningApi": {
@@ -198,11 +253,6 @@ Use a `distributions` block to deploy to several servers from the same project.
         }
       }
     }
-  },
-
-  "flutter": {
-    "projectDir": ".",
-    "flavor": null
   }
 }
 ```
@@ -212,6 +262,7 @@ Use a `distributions` block to deploy to several servers from the same project.
 Do not store credentials directly in `.xfixrc.json`. Use environment variables.
 
 ```bash
+# Deployment
 export DEPLOY_PASSWORD="your-ftp-password"
 export CLIENT_ID="your-client-id"
 export API_KEY="your-api-key"
@@ -219,10 +270,18 @@ export API_KEY="your-api-key"
 # Android signing
 export XFIX_APP_ID="app_your_app_identifier"
 export XFIX_API_KEY="sk_live_..."
+export XFIX_API_URL="https://api.xfixglobal.com"
 export ANDROID_KEYSTORE_PASSWORD="your-keystore-password"
+
+# Optional keystore overrides
+export ANDROID_KEYSTORE_PATH="android/app/release.jks"
+export ANDROID_KEY_ALIAS="release"
+export ANDROID_KEY_PASSWORD="your-key-password"
 ```
 
 XFIX CLI resolves these values at runtime. The `auth` blocks in `.xfixrc.json` describe which headers to send and which environment variables hold the values; the values themselves never appear in the config file.
+
+Precedence for any value that can be set multiple ways is always **CLI flag → environment variable → `.xfixrc.json` → built-in default**.
 
 ## Configuration Options
 
@@ -260,15 +319,21 @@ XFIX CLI resolves these values at runtime. The `auth` blocks in `.xfixrc.json` d
 
 ### Android signing
 
-| Option                             | Type   | Description                                            |
-| ---------------------------------- | ------ | ------------------------------------------------------ |
-| android.appId                      | string | Application identifier used as `XFIX-APP-ID`           |
-| android.keystorePath               | string | Path to the local `.jks` file                          |
-| android.keyAlias                   | string | Alias to sign with                                     |
-| android.credentialsApi.url         | string | Endpoint that returns signing credentials              |
-| android.credentialsApi.auth        | object | Header definitions with `{ env: "..." }` references    |
-| android.provisioningApi.url        | string | Base endpoint for the two-phase provisioning flow      |
-| android.provisioningApi.auth       | object | Header definitions for the provisioning endpoint       |
+| Option                             | Type   | Description                                                    |
+| ---------------------------------- | ------ | -------------------------------------------------------------- |
+| android.appId                      | string | Application identifier used as `XFIX-APP-ID`                   |
+| android.apiUrl                     | string | Base URL of the signing API (overrides anything derived below) |
+| android.keystorePath               | string | Path to the local `.jks` file                                  |
+| android.keyAlias                   | string | Alias to sign with                                             |
+| android.auth                       | object | Auth block — see "Auth shapes" above                           |
+| android.releaseBody                | object | JSON body sent to the credentials endpoint                     |
+| android.timeout                    | number | Request timeout in ms (default `10000`)                        |
+| android.retries                    | number | Retry count for API calls (default `2`)                        |
+| android.credentialsApi.url         | string | Legacy. Base URL derived from this when `apiUrl` is unset      |
+| android.credentialsApi.auth        | object | Legacy. Used when `android.auth` is unset                      |
+| android.credentialsApi.body        | object | Legacy. Used as `releaseBody` fallback                         |
+| android.provisioningApi.url        | string | Legacy. Base URL derived from this when `apiUrl` is unset      |
+| android.provisioningApi.auth       | object | Legacy. Used when `android.auth` is unset                      |
 
 ## .updateignore File
 
@@ -371,8 +436,10 @@ Provision a keystore and register it with a platform API in one command:
 xfix keystore provision
 xfix keystore provision --app-id app_other_identifier
 xfix keystore provision --skip-upload
-xfix keystore provision --api-url https://api.example.com/api/v1/android-signing/provision
+xfix keystore provision --api-url https://api.example.com
 ```
+
+`--api-url` overrides `android.apiUrl` (or `XFIX_API_URL`). It is a **base URL only** — the CLI appends the fixed contract paths (`/api/v1/android-signing/provision/prepare` and `/api/v1/android-signing/provision/commit`) itself. Passing a full endpoint path will not work.
 
 The `provision` command runs in four phases:
 
@@ -383,9 +450,9 @@ The `provision` command runs in four phases:
 
 App IDs resolve in this order: `--app-id` flag, then `android.appId` in `.xfixrc.json`, then the `XFIX_APP_ID` environment variable.
 
-Keystore paths resolve in this order: `--path` flag, then `android.keystorePath` in `.xfixrc.json`.
+Keystore paths resolve in this order: `--path` flag, then `android.keystorePath` in `.xfixrc.json`, then `ANDROID_KEYSTORE_PATH`.
 
-Passwords resolve in this order: `--storepass` flag, then the `ANDROID_KEYSTORE_PASSWORD` environment variable, then an interactive prompt. If the server reports that the password is administrator-managed, the CLI uses the server-supplied value and skips the prompt entirely.
+Passwords resolve in this order: `--storepass` flag, then the `ANDROID_KEYSTORE_PASSWORD` environment variable, then an interactive prompt. If the server reports `passwordOwner: "admin"`, the CLI uses the server-supplied value (after verifying it satisfies keytool's six-character minimum) and skips the prompt entirely.
 
 ### Database Migrations
 
@@ -438,11 +505,11 @@ Set `ANDROID_KEYSTORE_PASSWORD` and the CLI uses it directly, bypassing the cred
 
 ### Credentials API
 
-If no environment override is present and `android.credentialsApi` is configured, the CLI calls that endpoint with the headers described in its `auth` block. The server responds with the keystore password, key alias, and optionally a base64-encoded copy of the keystore file. If a base64 keystore is returned, the CLI writes it to a temporary file, signs with it, and deletes the file. This is what allows CI runners to sign without a `.jks` ever existing on disk.
+If no environment override is present, the CLI calls the release endpoint derived from `android.apiUrl` (or its legacy equivalent) with the headers described in `android.auth`. The server responds with the keystore password, key alias, and optionally a base64-encoded copy of the keystore file. If a base64 keystore is returned, the CLI writes it to a temporary file, signs with it, and deletes the file. This is what allows CI runners to sign without a `.jks` ever existing on disk.
 
 ### Local keystore fallback
 
-If neither the environment override nor the credentials API produces a keystore, the CLI falls back to the local file at `android.keystorePath`.
+If neither the environment override nor the credentials API produces a keystore, the CLI falls back to the local file at `android.keystorePath` (or `ANDROID_KEYSTORE_PATH`).
 
 Once credentials are resolved:
 
@@ -611,6 +678,14 @@ The JDK's keytool refuses passwords shorter than six characters. The value store
 
 Building an APK whose `applicationId` does not match the package name the server expects will cause Android to reject the update. Verify that `android/app/build.gradle` and the application record agree on the package name before uploading.
 
+### `keystore provision --api-url` does not work
+
+`--api-url` expects a base URL, not a full endpoint. Use `https://api.example.com`, not `https://api.example.com/api/v1/android-signing/provision`. The CLI appends the fixed contract paths itself.
+
+### `Missing env var` / `Header "…" requires env var`
+
+An `android.auth` block references an environment variable that is not set in the current shell. Export the variable (or add it to `.env` if you load dotenv before invoking the CLI) and re-run.
+
 ## Architecture Overview
 
 ```
@@ -635,6 +710,8 @@ xfix-cli/
 |-- src/
 |   |-- app.js
 |   |-- index.js
+|   |-- config/
+|   |   |-- index.js
 |   |-- partials/
 |-- .xfixrc.json
 |-- .updateignore
