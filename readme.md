@@ -18,7 +18,7 @@ It is suitable for:
 ### Deployment
 
 - Automated packaging into optimized ZIP archives
-- FTP/FTPS upload with retry mechanism
+- FTP, FTPS, and SFTP upload with retry mechanism
 - Remote deployment via HTTP endpoint
 - Branch restriction to prevent unintended deployments
 - File filtering using `.updateignore`
@@ -73,7 +73,7 @@ It is suitable for:
 - Node.js >= 18.x
 - PHP >= 7.4 (for PHP obfuscation)
 - Composer (for Yakpro-PO)
-- FTP/FTPS server with write access (deployment only)
+- FTP/FTPS or SFTP server with write access (deployment only)
 - Git repository (deployment only)
 - Flutter SDK (build and signing only)
 - JDK 11+ (for keytool and jarsigner)
@@ -94,10 +94,11 @@ export PATH="$HOME/.composer/vendor/bin:$PATH"
 
 Create a `.xfixrc.json` file in your project root. Every section is optional; the CLI only requires the sections relevant to the command you run.
 
-### Deployment configuration
+### Deployment configuration (FTP / FTPS)
 
 ```json
 {
+  "protocol": "ftp",
   "host": "ftp.yourdomain.com",
   "username": "your-ftp-username",
   "password": "${DEPLOY_PASSWORD}",
@@ -138,22 +139,87 @@ Create a `.xfixrc.json` file in your project root. Every section is optional; th
 }
 ```
 
+### Deployment configuration (SFTP)
+
+Set `protocol` to `sftp` to upload over SSH instead of FTP. Port defaults to `22`, and the SFTP-specific connection options (`readyTimeout`, `retryFactor`, `retryMinTimeout`) apply.
+
+```json
+{
+  "protocol": "sftp",
+  "host": "workspace.xfixglobal.com",
+  "username": "deploy-user",
+  "password": "${DEPLOY_PASSWORD}",
+  "port": 22,
+  "remotePath": "workspace.xfixglobal.com/public/store/deploy/",
+  "deployPath": "workspace.xfixglobal.com/",
+  "branch": "develop",
+  "cleanupLocal": false,
+  "secure": true,
+  "rejectUnauthorized": false,
+  "maxRetries": 3,
+  "readyTimeout": 30000,
+  "retryFactor": 2,
+  "retryDelay": 2000,
+  "retryMinTimeout": 2000,
+  "verbose": false,
+  "deployUrl": "https://xfixglobal.com/api/v1/deploy",
+  "allowBackup": false,
+  "runMigrations": false,
+  "clearCache": false,
+  "runComposer": false,
+  "clientId": "${CLIENT_ID}",
+  "apiKey": "${API_KEY}",
+  "obfuscateJs": false,
+  "obfuscatePhp": false,
+  "jsSrcPath": "public/js",
+  "jsDestPath": "public/orig",
+  "preserveOriginal": "public/original_js_asset_folder",
+  "domainLock": [
+    "http://localhost",
+    "http://127.0.0.1",
+    "https://workspace.xfixglobal.com",
+    "https://www.workspace.xfixglobal.com"
+  ],
+  "domainLockRedirectUrl": "https://workspace.xfixglobal.com",
+  "exclude": [
+    "tests",
+    "vendor.js",
+    "vendor",
+    "resources",
+    "node_modules",
+    ".git",
+    ".env"
+  ]
+}
+```
+
+Notes on SFTP:
+
+- `remotePath` is the directory the ZIP is uploaded into over SFTP.
+- `deployPath` is passed to the remote deployment endpoint so the server knows where to extract.
+- `secure: true` is still required to enable full obfuscation. It has no effect on the SFTP transport itself (SFTP is already encrypted).
+- `rejectUnauthorized` is not used by the SFTP client.
+- Set `verbose: true` to log SFTP protocol messages and per-file transfer progress.
+
 ### Multi-distribution configuration
 
-Use a `distributions` block to deploy to several servers from the same project.
+Use a `distributions` block to deploy to several servers from the same project. Each distribution can use a different protocol.
 
 ```json
 {
   "distributions": {
     "production": {
-      "host": "ftp.yourdomain.com",
+      "protocol": "sftp",
+      "host": "workspace.xfixglobal.com",
       "username": "prod-user",
       "password": "${PROD_DEPLOY_PASSWORD}",
-      "remotePath": "public_html/",
-      "deployPath": "public_html/",
+      "port": 22,
+      "remotePath": "workspace.xfixglobal.com/public/store/deploy/",
+      "deployPath": "workspace.xfixglobal.com/",
       "branch": "main"
     },
     "staging": {
+      "protocol": "ftp",
       "host": "staging.yourdomain.com",
       "username": "staging-user",
       "password": "${STAGING_DEPLOY_PASSWORD}",
@@ -263,7 +329,7 @@ Do not store credentials directly in `.xfixrc.json`. Use environment variables.
 
 ```bash
 # Deployment
-export DEPLOY_PASSWORD="your-ftp-password"
+export DEPLOY_PASSWORD="your-ftp-or-sftp-password"
 export CLIENT_ID="your-client-id"
 export API_KEY="your-api-key"
 
@@ -287,35 +353,40 @@ Precedence for any value that can be set multiple ways is always **CLI flag → 
 
 ### Deployment
 
-| Option                | Type    | Description                      |
-| --------------------- | ------- | -------------------------------- |
-| host                  | string  | FTP server hostname              |
-| username              | string  | FTP username                     |
-| password              | string  | FTP password or env reference    |
-| remotePath            | string  | Remote directory                 |
-| deployPath            | string  | Server deploy path               |
-| branch                | string  | Allowed deployment branch        |
-| cleanupLocal          | boolean | Remove ZIP after upload          |
-| secure                | boolean | Enable FTPS and full obfuscation |
-| rejectUnauthorized    | boolean | SSL validation                   |
-| maxRetries            | number  | Upload retry attempts            |
-| retryDelay            | number  | Delay between retries            |
-| verbose               | boolean | Debug logging                    |
-| deployUrl             | string  | Deployment endpoint              |
-| allowBackup           | boolean | Backup before deployment         |
-| runMigrations         | boolean | Execute migrations               |
-| clearCache            | boolean | Clear application cache          |
-| runComposer           | boolean | Run composer install             |
-| clientId              | string  | API client ID                    |
-| apiKey                | string  | API key                          |
-| obfuscateJs           | boolean | Enable JS obfuscation            |
-| obfuscatePhp          | boolean | Enable PHP obfuscation           |
-| jsSrcPath             | string  | JS source directory              |
-| jsDestPath            | string  | JS output directory              |
-| preserveOriginal      | string  | Backup directory                 |
-| domainLock            | array   | Allowed domains                  |
-| domainLockRedirectUrl | string  | Redirect for blocked domains     |
-| exclude               | array   | Excluded files                   |
+| Option                | Type    | Description                                       |
+| --------------------- | ------- | ------------------------------------------------- |
+| protocol              | string  | Transport: `ftp` (default), `ftps`, or `sftp`     |
+| host                  | string  | FTP/FTPS/SFTP server hostname                     |
+| port                  | number  | Server port. Default `21` for ftp/ftps, `22` for sftp |
+| username              | string  | Login username                                    |
+| password              | string  | Login password or env reference                   |
+| remotePath            | string  | Remote directory the ZIP is uploaded to           |
+| deployPath            | string  | Server deploy path sent to the deploy endpoint    |
+| branch                | string  | Allowed deployment branch                         |
+| cleanupLocal          | boolean | Remove ZIP after upload                           |
+| secure                | boolean | Enable FTPS and full obfuscation                  |
+| rejectUnauthorized    | boolean | SSL validation (ftps only)                        |
+| maxRetries            | number  | Upload retry attempts                             |
+| retryDelay            | number  | Delay between retries (ms)                        |
+| readyTimeout          | number  | SFTP connection timeout in ms (default `30000`)   |
+| retryFactor           | number  | SFTP retry backoff factor (default `2`)           |
+| retryMinTimeout       | number  | SFTP minimum retry timeout in ms (default `2000`) |
+| verbose               | boolean | Debug logging (SFTP protocol trace when sftp)     |
+| deployUrl             | string  | Deployment endpoint                               |
+| allowBackup           | boolean | Backup before deployment                          |
+| runMigrations         | boolean | Execute migrations                                |
+| clearCache            | boolean | Clear application cache                           |
+| runComposer           | boolean | Run composer install                              |
+| clientId              | string  | API client ID                                     |
+| apiKey                | string  | API key                                           |
+| obfuscateJs           | boolean | Enable JS obfuscation                             |
+| obfuscatePhp          | boolean | Enable PHP obfuscation                            |
+| jsSrcPath             | string  | JS source directory                               |
+| jsDestPath            | string  | JS output directory                               |
+| preserveOriginal      | string  | Backup directory                                  |
+| domainLock            | array   | Allowed domains                                   |
+| domainLockRedirectUrl | string  | Redirect for blocked domains                      |
+| exclude               | array   | Excluded files                                    |
 
 ### Android signing
 
@@ -490,7 +561,9 @@ xfix dev generate service UserService RoleService PermissionService
 3. Apply obfuscation if enabled
 4. Scan files using `.updateignore`
 5. Create ZIP archive
-6. Upload via FTP/FTPS
+6. Upload over the configured protocol:
+   - `ftp` / `ftps` via `basic-ftp`
+   - `sftp` via `ssh2-sftp-client`
 7. Trigger remote deployment endpoint
 8. Cleanup local artifacts
 9. Log results
@@ -642,6 +715,14 @@ If a build or signing step fails, no artifact is published. Correct the underlyi
 - Verify the correct `remotePath`
 - Check write permissions
 
+### SFTP Connection Failure
+
+- Verify `port` (default is `22` for `protocol: "sftp"`)
+- Ensure the server allows password authentication, or configure key-based auth on the SFTP server
+- Increase `readyTimeout` if the handshake times out on slow links
+- Run with `verbose: true` to see the SFTP protocol trace
+- Confirm `remotePath` exists and the SSH user has write access
+
 ### Remote Extraction Failure (HTTP 500)
 
 - Increase `max_execution_time`
@@ -693,7 +774,7 @@ Local Machine
    |
 XFIX CLI
    |
-   +---> FTP/FTPS Upload (ZIP) ---> Remote Server ---> Deployment Endpoint ---> Extraction and Execution
+   +---> FTP / FTPS / SFTP Upload (ZIP) ---> Remote Server ---> Deployment Endpoint ---> Extraction and Execution
    |
    +---> Flutter Build ---> zipalign ---> apksigner ---> Signed APK
    |
