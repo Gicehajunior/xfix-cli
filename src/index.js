@@ -1575,8 +1575,19 @@ class CliService {
             });
 
             if (!aabPath) {
-                throw new Error('Flutter reported success but no AAB was found under build/app/outputs/bundle');
+                const debugDir = path.join(process.cwd(), 'build', 'app', 'outputs', 'bundle');
+                let listing = '(directory does not exist)';
+                if (await fs.pathExists(debugDir)) {
+                    const entries = await fs.readdir(debugDir);
+                    listing = entries.length ? entries.join(', ') : '(empty)';
+                }
+                throw new Error(
+                    'Flutter reported success but no AAB was found.\n' +
+                    `   Searched: ${path.relative(process.cwd(), debugDir)}\n` +
+                    `   Found:    ${listing}`
+                );
             }
+            
             console.log(`   📦 ${path.relative(process.cwd(), aabPath)}`);
 
             if (options.sign === false) {
@@ -1595,7 +1606,7 @@ class CliService {
             this.handleError(err, options.verbose);
         }
     }
-
+    
     /**
      * Translate the appstore-related Commander options into the shape
      * App::appstoreDeploy expects.

@@ -1092,7 +1092,7 @@ class App {
 
     /**
      * Read version_name / version_code from pubspec.yaml.
-     * Format: `version: 1.0.0+1` → { version_name: '1.0.0', version_code: 1 }
+     * Format: `version: 1.0.0+1` - { version_name: '1.0.0', version_code: 1 }
      */
     async readPubspecVersion(projectDir = '.') {
         const p = path.join(this.ROOT, projectDir, 'pubspec.yaml');
@@ -1275,6 +1275,8 @@ class App {
                 platform:                   a.platform,
                 artifact_type:              a.type,
                 architecture:               a.architecture ?? null,
+                variant_label:              a.variantLabel ?? null,
+                density:                    a.density      ?? 0,
                 file_name:                  path.basename(a.path),
                 file_hash:                  a.hash,
                 disk:                       'local',
@@ -1458,10 +1460,7 @@ class App {
             throw err;
         }
     }
-
-    // ─────────────────────────────────────────────────────────
-    // App store — orchestration
-    // ─────────────────────────────────────────────────────────
+    
     /**
      * High-level: hash the signed artifacts, compose the manifest,
      * upload, and optionally release + publish.
@@ -1482,66 +1481,381 @@ class App {
             return null;
         }
 
-        // Prepare artifacts with hash + cert fingerprint
-        const artifacts = [];
-        for (const p of artifactPaths) {
-            const ext      = path.extname(p).toLowerCase();
-            const type     = ext === '.aab' ? 'aab' : ext === '.apk' ? 'apk' : 'zip';
-            const platform = opts.platform
-                ?? (type === 'aab' || type === 'apk' ? 'android' : 'unknown');
+        // Track temp dirs so we can clean up after upload, not before.
+        const tmpDirs = [];
 
-            artifacts.push({
-                path:         p,
-                type,
-                platform,
-                architecture: opts.architecture ?? null,
-                hash:         await this.sha256File(p),
-                certSha:      type === 'apk'
-                    ? await this.signingCertificateSha256(p)
-                    : null,
-                signedAt:     type === 'apk' ? new Date().toISOString() : null,
-                mime:         null,
+        try {
+            // hash the primary artifacts (AAB / APK / IPA)
+            const artifacts = [];
+            for (const p of artifactPaths) {
+                const ext      = path.extname(p).toLowerCase();
+                const type     = ext === '.aab' ? 'aab' : ext === '.apk' ? 'apk' : 'zip';
+                const platform = opts.platform
+                    ?? (type === 'aab' || type === 'apk' ? 'android' : 'unknown');
+
+                artifacts.push({
+                    path:         p,
+                    type,
+                    platform,
+                    architecture: opts.architecture ?? null,
+                    density:      0,
+                    variantLabel: null,
+                    hash:         await this.sha256File(p),
+                    certSha:      type === 'apk'
+                        ? await this.signingCertificateSha256(p)
+                        : null,
+                    signedAt:     type === 'apk' || type === 'aab'
+                        ? new Date().toISOString()
+                        : null,
+                    mime:         null,
+                });
+            }
+
+            //  extract APK variants from the AAB
+            const aab = artifactPaths.find(p => p.toLowerCase().endsWith('.aab'));
+
+            if (aab && opts.sign !== false) {
+                this.log('Extracting APK variants from AAB...', false, 'archive');
+
+                const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'xfix-apks-'));
+                tmpDirs.push(tmpDir);
+
+                let variants = [];
+                try {
+                    variants = await this.extractApkVariants(aab, tmpDir, {
+                        keyAlias:     opts.keyAlias,
+                        keystorePath: opts.keystore,
+                    });
+                } catch (err) {
+                    this.log(
+                        `Variant extraction failed: ${err.message}\n` +
+                        '   Uploading AAB only — server-side conversion may be required.',
+                        false,
+                        'warn'
+                    );
+                }
+
+                for (const v of variants) {
+                    artifacts.push({
+                        path:         v.path,
+                        type:         v.type,
+                        platform:     v.platform ?? 'android',
+                        architecture: v.abi,
+                        density:      v.density ?? 0,
+                        variantLabel: v.label ?? null,
+                        hash:         v.hash,
+                        certSha:      v.type === 'apk'
+                            ? await this.signingCertificateSha256(v.path)
+                            : null,
+                        signedAt:     new Date().toISOString(),
+                        mime:         v.type === 'apk'
+                            ? 'application/vnd.android.package-archive'
+                            : 'application/zip',
+                    });
+                    this.log(
+                        `  • ${v.label ?? v.abi} (${(await fs.stat(v.path)).size} bytes)`,
+                        true,
+                        'archive'
+                    );
+                }
+
+                // Full upload manifest
+                this.log('', false, 'space');
+                this.log(`  Build upload manifest (${artifacts.length} artifact(s)):`, false, 'upload');
+
+                const artLabelW = Math.max(
+                    7,
+                    ...artifacts.map(a =>
+                        (a.variantLabel || path.basename(a.path)).length
+                    )
+                );
+                const artPlatW = Math.max(8, ...artifacts.map(a => a.platform.length));
+                const artTypeW = Math.max(4, ...artifacts.map(a => a.type.length));
+                const artAbiW  = Math.max(3, ...artifacts.map(a => (a.architecture ?? '-').length));
+
+                this.log(
+                    `  ${'#'.padEnd(3)} ${'File / Label'.padEnd(artLabelW)} ` +
+                    `${'Platform'.padEnd(artPlatW)} ${'Type'.padEnd(artTypeW)} ` +
+                    `${'ABI Name'.padEnd(artAbiW)} ${'File Size'.padStart(10)}  Signed  Certificate`,
+                    false, 'upload'
+                );
+                this.log(
+                    `  ${'─'.repeat(3)} ${'─'.repeat(artLabelW)} ` +
+                    `${'─'.repeat(artPlatW)} ${'─'.repeat(artTypeW)} ` +
+                    `${'─'.repeat(artAbiW)} ${'─'.repeat(10)}  ${'─'.repeat(6)}  ${'─'.repeat(12)}`,
+                    false, 'upload'
+                );
+
+                let grandTotal = 0;
+
+                for (let i = 0; i < artifacts.length; i++) {
+                    const a    = artifacts[i];
+                    const size = (await fs.stat(a.path)).size;
+                    grandTotal += size;
+
+                    const human = size > 1024 * 1024
+                        ? `${(size / (1024 * 1024)).toFixed(2)} MB`
+                        : `${(size / 1024).toFixed(1)} KB`;
+
+                    const displayName = a.variantLabel || path.basename(a.path);
+                    const trimmed     = displayName.length > artLabelW
+                        ? '…' + displayName.slice(-(artLabelW - 1))
+                        : displayName;
+
+                    this.log(
+                        `  ${String(i + 1).padEnd(3)} ` +
+                        `${trimmed.padEnd(artLabelW)} ` +
+                        `${a.platform.padEnd(artPlatW)} ` +
+                        `${a.type.padEnd(artTypeW)} ` +
+                        `${(a.architecture ?? '-').padEnd(artAbiW)} ` +
+                        `${human.padStart(10)}  ` +
+                        `${(a.signedAt ? 'yes' : 'no').padEnd(6)}  ` +
+                        `${(a.certSha ?? '-').slice(0, 12)}`,
+                        false,
+                        'upload'
+                    );
+                }
+
+                this.log(
+                    `  Total payload: ${(grandTotal / (1024 * 1024)).toFixed(2)} MB`,
+                    false,
+                    'upload'
+                );
+                
+                this.log('', false, 'space');
+            } else if (aab && opts.sign === false) {
+                this.log(
+                    'Skipping variant extraction — signing was skipped (--no-sign).',
+                    false,
+                    'warn'
+                );
+            }
+
+            
+            const manifest = await this.buildBuildManifest(artifacts, {
+                ...opts,
+                channel: opts.channel || cfg.channel,
+            });
+
+            const allPaths = artifacts.map(a => a.path);
+            const build = await this.uploadBuild(cfg.identifier, manifest, allPaths);
+
+            //  release / publish
+            if (!opts.release && !opts.publish) {
+                return { build, release: null };
+            }
+
+            const releasePayload = {
+                build_uuid:           build.uuid,
+                channel_slug:         opts.channel      || cfg.channel,
+                title:                opts.title        || cfg.releaseBody.title || undefined,
+                changelog:            opts.changelog    ?? cfg.releaseBody.changelog,
+                release_notes_public: opts.releaseNotes ?? cfg.releaseBody.release_notes_public,
+                rollout_percentage:   opts.rollout      ?? 100,
+                is_mandatory:         !!opts.mandatory,
+                is_prerelease:        !!opts.prerelease,
+                publish:              !!opts.publish,
+                scheduled_at:         opts.scheduledAt ?? null,
+                platforms:            opts.platforms   ?? null,
+            };
+
+            const release = await this.createRelease(cfg.identifier, releasePayload);
+
+            if (opts.publish && release.status === 'draft') {
+                this.log(
+                    `Release created as draft — channel '${releasePayload.channel_slug}' requires review.`,
+                    false,
+                    'warn'
+                );
+            } else if (opts.publish) {
+                this.log(`Release ${release.uuid} published.`, false, 'success');
+            }
+
+            return { build, release };
+
+        } finally {
+            // Clean up temp dirs AFTER the upload has finished (or failed).
+            for (const dir of tmpDirs) {
+                await fs.remove(dir).catch(() => {});
+            }
+        }
+    }
+
+    async extractApkVariants(aabPath, tmpDir, opts = {}) {
+        const bundletool = await this.findBundletool();
+        if (!bundletool) {
+            this.log('bundletool not found — skipping variant extraction', false, 'warn');
+            return [];
+        }
+
+        const apksPath = path.join(tmpDir, 'app.apks');
+
+        // AAB - .apks archive
+        await this.runTool(bundletool, [
+            'build-apks',
+            `--bundle=${aabPath}`,
+            `--output=${apksPath}`,
+            '--mode=default',
+        ]);
+
+        // .apks - per-device splits
+        const DEVICE_SPECS = [
+            { label: 'arm64_xxhdpi', abi: 'arm64-v8a',   density: 480 },
+            { label: 'arm64_xhdpi',  abi: 'arm64-v8a',   density: 320 },
+            { label: 'arm32_hdpi',   abi: 'armeabi-v7a', density: 240 },
+            { label: 'x86_64_xhdpi', abi: 'x86_64',      density: 320 },
+        ];
+
+        const variants = [];
+
+        for (const v of DEVICE_SPECS) {
+            const specPath = path.join(tmpDir, `spec-${v.label}.json`);
+            await fs.writeJson(specPath, {
+                supportedAbis:    [v.abi],
+                screenDensity:    v.density,
+                sdkVersion:       34,
+                supportedLocales: ['en-US'],
+                deviceFeatures:   [],
+                glExtensions:     [], 
+            });
+
+            const outDir = path.join(tmpDir, `out-${v.label}`);
+            await this.runTool(bundletool, [
+                'extract-apks',
+                `--apks=${apksPath}`,
+                `--device-spec=${specPath}`,
+                `--output-dir=${outDir}`,
+            ]);
+
+            const zipPath = path.join(tmpDir, `${v.label}.zip`);
+            await this.zipDir(outDir, zipPath);
+
+            variants.push({
+                path:     zipPath,
+                type:     'zip',
+                platform: 'android',
+                abi:      v.abi,
+                density:  v.density,
+                label:    v.label,                 // ← ADDED
+                hash:     await this.sha256File(zipPath),
             });
         }
 
-        const manifest = await this.buildBuildManifest(artifacts, {
-            ...opts,
-            channel: opts.channel || cfg.channel,
+        // Universal fallback
+        const universalApksPath = path.join(tmpDir, 'app-universal.apks');
+
+        await this.runTool(bundletool, [
+            'build-apks',
+            `--bundle=${aabPath}`,
+            `--output=${universalApksPath}`,
+            '--mode=universal',
+        ]);
+
+        const AdmZip       = (await import('adm-zip')).default;
+        const universalZip = new AdmZip(universalApksPath);
+        const universalApk = universalZip.getEntry('universal.apk');
+
+        if (universalApk) {
+            const universalPath = path.join(tmpDir, 'universal.apk');
+            await fs.writeFile(universalPath, universalApk.getData());
+
+            variants.push({
+                path:     universalPath,
+                type:     'apk',
+                platform: 'android',
+                abi:      'universal',
+                density:  0,
+                label:    'universal',
+                hash:     await this.sha256File(universalPath),
+            });
+        }
+
+        return variants;
+    }
+
+    async findBundletool() { 
+        if (process.env.BUNDLETOOL_JAR && await fs.pathExists(process.env.BUNDLETOOL_JAR)) {
+            return process.env.BUNDLETOOL_JAR;
+        }
+
+        // Common project-local locations
+        const candidates = [
+            path.join(this.ROOT, 'bundletool-all.jar'),
+            path.join(this.ROOT, 'tools', 'bundletool-all.jar'),
+            path.join(this.ROOT, '.xfix', 'bundletool-all.jar'),
+            path.join(os.homedir(), '.xfix', 'bundletool-all.jar'),
+        ];
+
+        for (const c of candidates) {
+            if (await fs.pathExists(c)) return c;
+        }
+
+        // Look for it as a .jar under any versioned dir
+        const toolsDir = path.join(this.ROOT, 'tools');
+        if (await fs.pathExists(toolsDir)) {
+            const entries = await fs.readdir(toolsDir);
+            const jar = entries.find(f => /^bundletool.*\.jar$/i.test(f));
+            if (jar) return path.join(toolsDir, jar);
+        }
+
+        return null;
+    }
+
+    async runTool(binary, args) {
+        const { spawnSync } = await import('node:child_process');
+
+        const isWin = process.platform === 'win32';
+        const isJar = binary.toLowerCase().endsWith('.jar');
+
+        let cmd, cmdArgs;
+
+        if (isJar) {
+            // java -jar /path/to/bundletool.jar <args>
+            cmd = 'java';
+            cmdArgs = ['-jar', binary, ...args];
+        } else if (isWin) { 
+            cmd = 'cmd.exe';
+            cmdArgs = ['/d', '/s', '/c',
+                `"${binary}" ${args.map(a => `"${a}"`).join(' ')}`
+            ];
+        } else {
+            cmd = binary;
+            cmdArgs = args;
+        }
+
+        const result = spawnSync(cmd, cmdArgs, {
+            stdio: ['ignore', 'pipe', 'pipe'],
+            encoding: 'utf8',
+            windowsHide: false,
         });
 
-        const build = await this.uploadBuild(cfg.identifier, manifest, artifactPaths);
-
-        if (!opts.release && !opts.publish) {
-            return { build, release: null };
+        if (result.error) {
+            throw new Error(`${path.basename(binary)} spawn failed: ${result.error.message}`);
         }
 
-        const releasePayload = {
-            build_uuid:           build.uuid,
-            channel_slug:         opts.channel      || cfg.channel,
-            title:                opts.title        || cfg.releaseBody.title || undefined,
-            changelog:            opts.changelog    ?? cfg.releaseBody.changelog,
-            release_notes_public: opts.releaseNotes ?? cfg.releaseBody.release_notes_public,
-            rollout_percentage:   opts.rollout      ?? 100,
-            is_mandatory:         !!opts.mandatory,
-            is_prerelease:        !!opts.prerelease,
-            publish:              !!opts.publish,
-            scheduled_at:         opts.scheduledAt ?? null,
-            platforms:            opts.platforms   ?? null,
-        };
-
-        const release = await this.createRelease(cfg.identifier, releasePayload);
-
-        if (opts.publish && release.status === 'draft') {
-            this.log(
-                `Release created as draft — channel '${releasePayload.channel_slug}' requires review.`,
-                false,
-                'warn'
+        if (result.status !== 0) {
+            throw new Error(
+                `${path.basename(binary)} ${args[0]} failed (exit ${result.status}):\n` +
+                (result.stderr || result.stdout || '').trim()
             );
-        } else if (opts.publish) {
-            this.log(`Release ${release.uuid} published.`, false, 'success');
         }
 
-        return { build, release };
+        return result.stdout;
+    }
+
+    async zipDir(srcDir, destZipPath) {
+        return new Promise((resolve, reject) => {
+            const output  = fs.createWriteStream(destZipPath);
+            const archive = archiver('zip', { zlib: { level: 9 } });
+
+            output.on('close', resolve);
+            output.on('error', reject);
+            archive.on('error', reject);
+
+            archive.pipe(output);
+            archive.directory(srcDir, false);
+            archive.finalize();
+        });
     }
 
     /**
@@ -1615,19 +1929,45 @@ class App {
 
     /**
      * Locate the AAB produced by a Flutter build.
+     *
+     * Flutter writes AABs into a variant subdirectory under
+     * build/app/outputs/bundle/ (e.g. bundle/release/, bundle/prodRelease/),
+     * not directly into bundle/
      */
     async findFlutterAab(flavor) {
-        const dir = path.join(this.ROOT, 'build', 'app', 'outputs', 'bundle');
-        if (!await fs.pathExists(dir)) return null;
+        const baseDir = path.join(this.ROOT, 'build', 'app', 'outputs', 'bundle');
+        if (!await fs.pathExists(baseDir)) return null;
 
-        const entries = await fs.readdir(dir);
-        const prefix = flavor ? `${flavor}Release` : 'release';
+        const walk = async (dir) => {
+            const out = [];
+            const entries = await fs.readdir(dir, { withFileTypes: true });
 
-        const match = entries.find(f =>
-            f.toLowerCase() === `${prefix.toLowerCase()}.aab` ||
-            (f.startsWith(prefix) && f.endsWith('.aab'))
+            for (const entry of entries) {
+                const full = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                    out.push(...await walk(full));
+                } else if (entry.isFile() && entry.name.endsWith('.aab')) {
+                    out.push(full);
+                }
+            }
+
+            return out;
+        };
+
+        const matches = await walk(baseDir);
+        if (!matches.length) return null;
+
+        const expected = flavor ? `app-${flavor}-release.aab` : 'app-release.aab';
+        const exact    = matches.find(p => path.basename(p) === expected);
+        if (exact) return exact;
+
+        const withStats = await Promise.all(
+            matches.map(async (p) => ({ p, mtime: (await fs.stat(p)).mtimeMs }))
         );
-        return match ? path.join(dir, match) : null;
+
+        withStats.sort((a, b) => b.mtime - a.mtime);
+
+        return withStats[0].p;
     }
 
     /**
