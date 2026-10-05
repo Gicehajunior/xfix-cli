@@ -2113,7 +2113,7 @@ class CliService {
             });
         });
     }
-
+    
     /**
      * Display help information.
      */
@@ -2142,7 +2142,7 @@ class CliService {
         console.log('  revert    Revert obfuscated files to originals');
         console.log('  db        Database migration management');
         console.log('  dev       Development tools');
-        console.log('  build     Flutter builds + Android signing');
+        console.log('  build     Flutter builds + Android signing + app store upload');
         console.log('  keystore  Android keystore (JKS) management');
         console.log('  flutter   Raw Flutter CLI passthrough');
 
@@ -2211,6 +2211,41 @@ class CliService {
         console.log('  xfix keystore generate --path android/app/release.jks --alias release');
         console.log('  xfix flutter pub get');
         console.log('  xfix flutter doctor -v');
+
+        // ── App Store Upload ────────────────────────────────────────────────
+        console.log('\n📤 App Store Upload (xfix build apk / xfix build aab):');
+        console.log('─'.repeat(50));
+        console.log('  --deploy                Upload the signed artifact to the app store');
+        console.log('  --release               Upload + create a DRAFT release');
+        console.log('  --publish               Upload + create + PUBLISH in one shot');
+        console.log('  --channel <slug>        Release channel (default: config, then "stable")');
+        console.log('  --app-id <id>           Override XFIX app_id for this run');
+        console.log('  --api-url <url>         Override XFIX API base URL for this run');
+        console.log('  --title <text>          Release title');
+        console.log('  --notes <text>          Public release notes');
+        console.log('  --changelog <text>      Changelog body');
+        console.log('  --rollout <n>           Rollout percentage (0-100)');
+        console.log('  --mandatory             Mark release as mandatory');
+        console.log('  --prerelease            Mark release as prerelease');
+        console.log('  --platform <list>       Comma-separated platforms, e.g. android,ios');
+
+        console.log('\n💡 Examples:');
+        console.log('  xfix build apk --deploy                              # Upload signed APK only');
+        console.log('  xfix build apk --deploy --verbose                    # Upload with progress');
+        console.log('  xfix build aab --release --channel beta              # Draft release on beta');
+        console.log('  xfix build aab --release --channel production        # Draft release on prod');
+        console.log('  xfix build apk --publish --rollout 25 --mandatory    # Staged rollout, mandatory');
+        console.log('  xfix build aab --publish --prerelease                # Publish as prerelease');
+        console.log('  xfix build apk --deploy --app-id app_other_id        # Override target app');
+        console.log('  xfix build apk --deploy --api-url https://store.x.com # Override store URL');
+        console.log('  xfix build apk --sign-only --apk build/app/outputs/flutter-apk/app-release.apk --deploy');
+
+        console.log('\nℹ️  Notes:');
+        console.log('  • Requires appstore.* in .xfixrc.json (falls back to android.apiUrl + android.appId)');
+        console.log('  • --release creates a DRAFT; only --publish makes it live');
+        console.log('  • If the target channel requires review, --publish still ends up as draft');
+        console.log('  • Upload failures do NOT fail the build — the signed artifact is on disk');
+        console.log('    and can be re-uploaded with: xfix build apk --sign-only --apk <path> --deploy');
     }
 
     /**
