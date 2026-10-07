@@ -999,9 +999,13 @@ class App {
             }
         }
     }
-
+    
     /**
      * Sign an AAB (jarsigner-style signing).
+     *
+     * Guarantees exactly ONE certificate chain in the output by stripping
+     * any pre-existing META-INF signatures (Gradle debug, prior runs, etc.)
+     * before invoking jarsigner, then asserting the result.
      */
     async signAab(aabPath, options = {}) {
         const cfg = await this.getAndroidConfig();
@@ -1029,6 +1033,9 @@ class App {
         const keyAlias = resolved.keyAlias || cfg.keyAlias;
         const keyPassword = resolved.keyPassword || storePassword;
 
+        this.log(`  Keystore: ${keystorePath}`, true, 'info');
+        this.log(`  Alias:    ${keyAlias}`, true, 'info');
+        this.log(`  Source:   ${resolved.source}`, true, 'info');
         try {
             if (!keystorePath || !await fs.pathExists(keystorePath)) {
                 throw new Error(`Keystore not found: ${keystorePath}`);
@@ -1039,6 +1046,11 @@ class App {
 
             this.log(`  Credentials source: ${resolved.source}`, true, 'info');
 
+            const stripped = await this.stripAabSignatures(aabPath);
+            if (stripped > 0) {
+                this.log(`  Stripped ${stripped} pre-existing signature file(s)`, true, 'info');
+            }
+            
             const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'xfix-jar-'));
             const storeFile = path.join(tmpDir, 'store.txt');
             const keyFile = path.join(tmpDir, 'key.txt');
@@ -1052,6 +1064,8 @@ class App {
                     '-keypass:file', keyFile,
                     '-sigalg', 'SHA256withRSA',
                     '-digestalg', 'SHA-256',
+                    '-sigfile', 'XFIX',
+                    '-tsa', 'http://timestamp.digicert.com',
                     aabPath,
                     keyAlias,
                 ];
@@ -1062,6 +1076,8 @@ class App {
             } finally {
                 await fs.remove(tmpDir).catch(() => {});
             }
+            
+            await this.assertSingleAabSignature(aabPath);
 
             this.log(`  Signed: ${path.relative(this.ROOT, aabPath)}`, false, 'success');
             return aabPath;
@@ -1070,6 +1086,56 @@ class App {
             if (tempKeystore) {
                 await fs.remove(tempKeystore.cleanupDir).catch(() => {});
             }
+        }
+    }
+
+    /**
+     * Remove every signature-related entry from META-INF inside an AAB.
+     *
+     * Leaves MANIFEST.MF untouched — jarsigner merges into it rather than
+     * needing a clean slate, and other META-INF entries (services/, etc.)
+     * must survive.
+     *
+     * Returns the number of files removed.
+     */
+    async stripAabSignatures(archivePath) {
+        const AdmZip = (await import('adm-zip')).default;
+        const zip = new AdmZip(archivePath);
+
+        const SIG_RE = /^META-INF\/[^/]+\.(RSA|DSA|EC|SF)$/i;
+        const toDelete = zip.getEntries()
+            .map(e => e.entryName)
+            .filter(name => SIG_RE.test(name));
+
+        if (toDelete.length === 0) return 0;
+
+        for (const name of toDelete) {
+            zip.deleteFile(name);
+        }
+        zip.writeZip(archivePath);
+
+        return toDelete.length;
+    }
+
+    /**
+     * Throw if the AAB does not contain exactly one signature block.
+     *
+     * One .SF file = one certificate chain. Multiple = Play Store reject.
+     */
+    async assertSingleAabSignature(archivePath) {
+        const AdmZip = (await import('adm-zip')).default;
+        const zip = new AdmZip(archivePath);
+
+        const sfFiles = zip.getEntries()
+            .map(e => e.entryName)
+            .filter(name => /^META-INF\/[^/]+\.SF$/i.test(name));
+
+        if (sfFiles.length !== 1) {
+            throw new Error(
+                `Signed AAB contains ${sfFiles.length} signature block(s); expected exactly 1.\n` +
+                `   Files: ${sfFiles.join(', ') || '(none)'}\n` +
+                '   This would be rejected by Play Console. Aborting.'
+            );
         }
     }
 
