@@ -55,7 +55,7 @@ export const ANDROID_DEFAULTS = Object.freeze({
 export const APPSTORE_DEFAULTS = Object.freeze({
     channel:      'stable',
     timeout:      60_000,
-    maxArtifacts: 8,
+    maxArtifacts: 3,
 });
 
 /**

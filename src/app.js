@@ -1367,13 +1367,6 @@ class App {
             );
         }
 
-        if (artifactPaths.length > APPSTORE_DEFAULTS.maxArtifacts) {
-            throw new Error(
-                `Too many artifacts (${artifactPaths.length}). ` +
-                `The server accepts up to ${APPSTORE_DEFAULTS.maxArtifacts}.`
-            );
-        }
-
         const url = joinUrl(
             cfg.apiUrl,
             APPSTORE_PATHS.builds.replace(
@@ -1697,7 +1690,29 @@ class App {
                 );
             }
 
-            
+            // Filter artifacts to respect maxArtifacts limit from config (before manifest)
+            const maxArtifacts = APPSTORE_DEFAULTS.maxArtifacts;
+            if (artifacts.length > maxArtifacts) {
+                // Prioritize AAB/APK (primary build artifacts) before truncating
+                artifacts.sort((a, b) => {
+                    const aPrimary = a.type === 'aab' || a.type === 'apk' ? 0 : 1;
+                    const bPrimary = b.type === 'aab' || b.type === 'apk' ? 0 : 1;
+                    return aPrimary - bPrimary;
+                });
+                this.log(
+                    `Truncating artifacts from ${artifacts.length} to ${maxArtifacts} (max allowed).`,
+                    false,
+                    'warn'
+                );
+                artifacts.splice(maxArtifacts);
+            }
+
+            // Snapshot print of artifacts after filtering
+            this.log(`Artifact snapshot (${artifacts.length} artifact(s)):`);
+            for (let i = 0; i < artifacts.length; i++) {
+                this.log(`  [${i + 1}] ${path.basename(artifacts[i].path)}`, false, 'upload');
+            }
+
             const manifest = await this.buildBuildManifest(artifacts, {
                 ...opts,
                 channel: opts.channel || cfg.channel,
